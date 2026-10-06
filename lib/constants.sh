@@ -41,8 +41,9 @@ CONVERT_VM_NAME=""
 # production SNP guest (no DEBUG, single-socket, host-data + platform certs
 # requirements). Override with --snp-policy for a specific deployment.
 SNP_POLICY="0x30000"
-# SNP VMPL (VM Privilege Level) for the guest OS: 0 = guest OS (required).
-SNP_VMPL=0
+# NOTE: the guest VMPL is deliberately not configurable here. libvirt's
+# <launchSecurity type='sev-snp'> schema has no VMPL element; the guest OS
+# runs at VMPL 0 and 'snpguest report --vmpl' selects the level per report.
 
 # Attestation collateral source: AMD KDS (Key Distribution Service).
 # Method 1 (kds):    fetch the ARK/ASK/VCEK certificate chain directly from

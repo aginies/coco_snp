@@ -32,9 +32,12 @@ generate_vm_xml() {
     fi
 
     # --- SNP mode: mirrors the SUSE/libvirt SNP reference config:
-    #   - <launchSecurity type='sev-snp'> with <policy> + <vms>. This triggers
-    #     libvirt's automatic SNP firmware selection (the 'amd-sev-snp' feature
-    #     descriptor) and the writable NVRAM setup. No explicit <loader>.
+    #   - <os firmware='efi'> + <launchSecurity type='sev-snp'> with <policy>.
+    #     firmware='efi' is what switches libvirt into firmware autoselection;
+    #     launchSecurity then narrows the choice to a descriptor advertising
+    #     the 'amd-sev-snp' feature and sets up the writable NVRAM. Without
+    #     firmware='efi' libvirt falls back to SeaBIOS and the guest never
+    #     boots, so it must not be omitted along with <loader>.
     #   - No host-side quote daemon (no QGS socket in the XML, unlike TDX).
     #   - vsock is optional (SNP attestation does not require it; the report
     #     is generated in-guest via GHCB and signed by the CPU's PSP).
@@ -74,17 +77,19 @@ generate_vm_xml() {
         firmware_attr=""
     else
         # SNP mode: rely on libvirt firmware autoselection (no explicit
-        # <loader>/<nvram>); <launchSecurity type='sev-snp'> triggers the
-        # 'amd-sev-snp' firmware descriptor + writable NVRAM setup.
+        # <loader>/<nvram>); firmware='efi' + <launchSecurity type='sev-snp'>
+        # select the 'amd-sev-snp' firmware descriptor and set up the
+        # writable NVRAM.
         loader_line=""
         nvram_line=""
         # SNP: no explicit memory backing (the PSP encrypts guest memory).
         memfd_line=""
         ioapic_line=""
-        # SNP: include launchSecurity with the launch policy + VM serial.
+        # SNP: include launchSecurity with the launch policy. The guest's VMPL
+        # is not a domain-XML knob (libvirt's sev-snp schema has no <vms>
+        # element); VMPL 0 is what the guest OS gets by default.
         launchsec_line="  <launchSecurity type='sev-snp'>
     <policy>${SNP_POLICY}</policy>
-    <vms>${SNP_VMPL}</vms>
   </launchSecurity>"
         # SNP: include vsock (optional but useful for guest-host channels).
         vsock_line="    <vsock model='virtio'>
@@ -93,7 +98,7 @@ generate_vm_xml() {
         rng_line="    <rng model='virtio'>
       <backend model='random'>/dev/urandom</backend>
     </rng>"
-        firmware_attr=""
+        firmware_attr=" firmware='efi'"
         # SNP: hard memory limit slightly above guest RAM (firmware + overhead).
         local mem_hard_limit
         mem_hard_limit=$(((VM_MEM * 1024) + 369090))
@@ -386,10 +391,10 @@ build_virt_install_cmd() {
 patch_vm_xml_snp() {
     local input_xml="$1" output_xml="$2"
 
-    python3 - "$input_xml" "$output_xml" "$SNP_POLICY" "$SNP_VMPL" <<'PYEOF'
+    python3 - "$input_xml" "$output_xml" "$SNP_POLICY" <<'PYEOF'
 import sys, xml.etree.ElementTree as ET
 
-inp, outp, policy, vmpl = sys.argv[1:5]
+inp, outp, policy = sys.argv[1:4]
 tree = ET.parse(inp)
 root = tree.getroot()
 
@@ -400,13 +405,17 @@ os_ = find('os')
 if os_ is None:
     os_ = ET.SubElement(root, 'os')
 
-# Remove the regular <loader>/<nvram> that virt-install emitted. With
-# <launchSecurity type='sev-snp'> present, libvirt autoselects the SNP
-# firmware (feature 'amd-sev-snp') and sets up the writable NVRAM itself.
+# Remove the regular <loader>/<nvram> that virt-install emitted and switch
+# <os> to firmware autoselection instead: with firmware='efi' *and*
+# <launchSecurity type='sev-snp'> present, libvirt picks the descriptor
+# advertising the 'amd-sev-snp' feature and sets up the writable NVRAM
+# itself. Dropping the loader without setting firmware='efi' would leave the
+# domain on SeaBIOS.
 for tag in ('loader', 'nvram'):
     el = os_.find(tag)
     if el is not None:
         os_.remove(el)
+os_.set('firmware', 'efi')
 
 ls = find('launchSecurity')
 if ls is None:
@@ -416,10 +425,11 @@ pol = ls.find('policy')
 if pol is None:
     pol = ET.SubElement(ls, 'policy')
 pol.text = policy
+# libvirt's sev-snp schema has no <vms>/VMPL element; drop it if an older
+# revision of this script added one.
 vms = ls.find('vms')
-if vms is None:
-    vms = ET.SubElement(ls, 'vms')
-vms.text = str(vmpl)
+if vms is not None:
+    ls.remove(vms)
 
 devices = find('devices')
 if devices is not None and devices.find('vsock') is None:
@@ -583,7 +593,11 @@ Reinstall qemu with SNP target (package: $(distro_pkgs qemu))."
         echo ""
         local vi_xml
         vi_xml=$(mktemp /tmp/snp-vi-XXXXXX.xml)
-        if ! run "${VIRT_INSTALL_CMD[@]}" --print-xml >"$vi_xml"; then
+        # '--print-xml' without a step number prints *every* install step
+        # (installer boot + post-install boot) into one stream, which is not a
+        # parseable XML document. Step 1 is the installer boot — the one we
+        # define and start here.
+        if ! run "${VIRT_INSTALL_CMD[@]}" --print-xml 1 >"$vi_xml"; then
             rm -f "$vi_xml"
             die "virt-install --print-xml failed. See output above."
         fi
@@ -919,20 +933,21 @@ Boot the SNP VM first, then run:
 or run this command inside the SNP VM itself."
     fi
 
-    # The SNP guest attestation device node is /dev/sev-guest (provided by the
-    # snpguest kernel module). A real character device is required.
+    # The SNP guest attestation device node is /dev/sev-guest, provided by the
+    # 'sev-guest' kernel module (drivers/virt/coco/sev-guest) — not by the
+    # 'snpguest' userspace CLI. A real character device is required.
     log "Checking for a SNP guest attestation device (must exist INSIDE an SNP VM)"
     if ssh_guest "test -c /dev/sev-guest"; then
         log "Found /dev/sev-guest — running inside a real SNP VM"
     else
-        log "No /dev/sev-guest yet — attempting 'modprobe snpguest' in guest"
-        if ssh_guest "sudo modprobe snpguest 2>/dev/null; test -c /dev/sev-guest"; then
-            log "snpguest module loaded — /dev/sev-guest present"
+        log "No /dev/sev-guest yet — attempting 'modprobe sev-guest' in guest"
+        if ssh_guest "sudo modprobe sev-guest 2>/dev/null; test -c /dev/sev-guest"; then
+            log "sev-guest module loaded — /dev/sev-guest present"
         else
             die "No SNP guest attestation device found (/dev/sev-guest).
 This command must run INSIDE an SEV-SNP confidential VM, not on the host.
   - If you targeted localhost from the host: use --guest-ip <SNP_VM_IP> instead.
-  - Inside the SNP VM, check: 'modprobe snpguest' and 'dmesg | grep -i sev'.
+  - Inside the SNP VM, check: 'modprobe sev-guest' and 'dmesg | grep -i sev'.
     'modprobe: No such device' means the VM is not an SNP VM.
   - On the host, the VM must be started with <launchSecurity type='sev-snp'>
     and a SNP OVMF, with SEV-SNP enabled in BIOS.
@@ -1016,10 +1031,12 @@ EOF
         log "snp-report-gen installed in guest: ${SNP_REPORT_GEN_GUEST}"
     fi
 
-    # Ship the certificate chain to the guest so 'snpguest verify' can run
-    # fully in-guest (offline mode) or the guest can fetch it from KDS.
-    if [[ "$COLLATERAL_MODE" == "offline" && -s "$SNP_ARK_CERT" ]]; then
-        log "Shipping SNP certificate chain to guest (offline mode)"
+    # Ship the certificate chain to the guest so 'snpguest verify attestation'
+    # can run fully in-guest. Done in both collateral modes: in offline mode
+    # it is the only source, in kds mode it saves the guest a KDS round-trip
+    # (and works when the guest has no outbound internet access).
+    if [[ -s "$SNP_ARK_CERT" ]]; then
+        log "Shipping SNP certificate chain to guest (${SNP_CERT_DIR})"
         ssh_guest "sudo mkdir -p ${GUEST_WORKDIR}/certs"
         for cert in "$SNP_ARK_CERT" "$SNP_ASK_CERT" "$SNP_VCEK_CERT"; do
             if [[ -s "$cert" ]]; then

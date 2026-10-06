@@ -455,7 +455,10 @@ except Exception:
 # exit code.
 guest_generate_report() {
     local out rc=0
-    out=$(ssh_guest "cd ${GUEST_WORKDIR} && snpguest report -o report.dat" 2>&1) || rc=$?
+    # snpguest takes its paths positionally: 'report <att-report> <request>'.
+    # --random fills the 64-byte request (report_data) with fresh entropy, so
+    # each report carries its own nonce.
+    out=$(ssh_guest "cd ${GUEST_WORKDIR} && snpguest report report.dat request-data.txt --random" 2>&1) || rc=$?
     if ((rc != 0)); then
         local msg
         msg=$(grep -vE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] \[' <<<"$out" || true)
@@ -468,9 +471,20 @@ guest_generate_report() {
 
 # Verify a generated report in-guest (snpguest verify). Returns 0 if the
 # report passes in-guest verification, 1 otherwise.
+#
+# 'snpguest verify attestation <certs-dir> <att-report>' needs the ARK/ASK/VCEK
+# chain on disk in the guest; setup-guest ships it to ${GUEST_WORKDIR}/certs
+# whenever the host store is populated. Without it, in-guest verification is
+# skipped (it is informational — CoCo-AS verifies host-side anyway).
 guest_verify_report() {
     local out rc=0
-    out=$(ssh_guest "cd ${GUEST_WORKDIR} && snpguest verify -r report.dat" 2>&1) || rc=$?
+    local certs="${GUEST_WORKDIR}/certs"
+    if ! ssh_guest "test -s ${certs}/ark.pem"; then
+        echo "No certificate store in guest at ${certs} — skipping in-guest verification."
+        echo "Populate it from the host (setup-host) or in-guest with 'snpguest fetch ca/vcek'."
+        return 1
+    fi
+    out=$(ssh_guest "cd ${GUEST_WORKDIR} && snpguest verify attestation ${certs} report.dat" 2>&1) || rc=$?
     echo "$out"
     return "$rc"
 }

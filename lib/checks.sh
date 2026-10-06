@@ -381,16 +381,23 @@ cmd_check_platform() {
     if [[ -z "$url" ]]; then
         die "check-platform requires a KDS endpoint (--collateral kds, --kds-url <URL>)."
     fi
-    log "Fetching platform certificate chain from KDS: ${url}"
+    log "Fetching platform certificate chain from KDS (collateral endpoint: ${url})"
+    mkdir -p "$SNP_CERT_DIR" 2>/dev/null ||
+        die "check-platform needs write access to ${SNP_CERT_DIR}; re-run with sudo."
+    # 'snphost fetch' takes <kind> <encoding> <dir> positionally and always
+    # talks to AMD's KDS; it has no --kds-url option.
     local rc=0
-    run snphost fetch --kds-url "$url" || rc=$?
+    run snphost fetch ca pem "$SNP_CERT_DIR" || rc=$?
+    if ((rc == 0)); then
+        run snphost fetch vcek pem "$SNP_CERT_DIR" || rc=$?
+    fi
     if ((rc != 0)); then
         trap - ERR
         return $rc
     fi
     log "Verifying certificate chain (ARK -> ASK -> VCEK) and TCB OIDs"
     rc=0
-    run snphost verify certs || rc=$?
+    run snphost verify certs "$SNP_CERT_DIR" || rc=$?
     if ((rc != 0)); then
         trap - ERR
         return $rc

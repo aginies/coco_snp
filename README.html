@@ -368,14 +368,14 @@ ss -tln | grep -E '3000|8080'                  # ports listening</pre>
   <li><strong>Creates the domain definition.</strong> Two engines, same result:</li>
 </ol>
 <ul>
-  <li><strong>virt-install engine (default when <code>virt-install</code> is installed):</strong> the script extracts the installer kernel/initrd from the ISO (<code>/boot/x86_64/loader/{linux,initrd}</code>) into <code>/var/lib/libvirt/boot/&lt;vm&gt;-installer-{kernel,initrd}</code>, then runs <code>virt-install --name … --memory … --vcpus … --disk … --cpu host-passthrough --network network=default,model=virtio --graphics vnc,listen=… --video virtio --boot cdrom,hd --machine q35 --location &lt;ISO&gt; --extra-args console=ttyS0,115200 --print-xml</code> — i.e. <strong>XML generation only, nothing is started</strong>. The script then applies a post-define SNP patch (below) and defines + starts the domain <strong>once</strong> — so the SNP configuration is in place <em>before</em> the first boot.</li>
+  <li><strong>virt-install engine (default when <code>virt-install</code> is installed):</strong> the script extracts the installer kernel/initrd from the ISO (<code>/boot/x86_64/loader/{linux,initrd}</code>) into <code>/var/lib/libvirt/boot/&lt;vm&gt;-installer-{kernel,initrd}</code>, then runs <code>virt-install --name … --memory … --vcpus … --disk … --cpu host-passthrough --network network=default,model=virtio --graphics vnc,listen=… --video virtio --boot cdrom,hd --machine q35 --location &lt;ISO&gt; --extra-args console=ttyS0,115200 --print-xml 1</code> — i.e. <strong>XML generation only, nothing is started</strong>. The script then applies a post-define SNP patch (below) and defines + starts the domain <strong>once</strong> — so the SNP configuration is in place <em>before</em> the first boot.</li>
   <li><strong>Generated XML engine</strong> (<code>--no-virt-install</code>, or automatic fallback): the script writes the full domain XML itself.</li>
 </ul>
 <p>The SNP-critical elements and <em>why</em> each (both engines produce these):</p>
 <table>
   <tr><th>XML element</th><th>Why it's required</th></tr>
-  <tr><td><code>&lt;launchSecurity type='sev-snp'&gt;</code> + <code>&lt;policy&gt;</code> + <code>&lt;vms&gt;</code></td><td>Tells libvirt/QEMU to launch this VM as an SEV-SNP confidential VM. The <code>policy</code> (default <code>0x30000</code>) is the launch policy; <code>vms</code> is the VMPL (0 = guest OS). <strong>This element is what makes libvirt auto-select the SNP firmware and set up the writable NVRAM.</strong></td></tr>
-  <tr><td>(no explicit <code>&lt;loader&gt;</code>)</td><td>The SNP firmware is selected by libvirt's firmware autoselection from the <code>amd-sev-snp</code> descriptor once <code>launchSecurity type='sev-snp'</code> is present. Forcing a pflash loader without a matching NVRAM template would break the VM. (The virt-install engine <em>removes</em> the regular loader it emits.)</td></tr>
+  <tr><td><code>&lt;launchSecurity type='sev-snp'&gt;</code> + <code>&lt;policy&gt;</code></td><td>Tells libvirt/QEMU to launch this VM as an SEV-SNP confidential VM. The <code>policy</code> (default <code>0x30000</code>) is the launch policy. <strong>This element is what narrows libvirt's firmware autoselection to the SNP firmware.</strong> (libvirt's sev-snp schema has no VMPL element — the guest OS runs at VMPL 0.)</td></tr>
+  <tr><td><code>&lt;os firmware='efi'&gt;</code> and no explicit <code>&lt;loader&gt;</code></td><td><code>firmware='efi'</code> is what switches libvirt into firmware autoselection; <code>launchSecurity type='sev-snp'</code> then narrows it to the <code>amd-sev-snp</code> descriptor and sets up the writable NVRAM. Dropping the loader <em>without</em> <code>firmware='efi'</code> leaves the domain on SeaBIOS and it will not boot. (The virt-install engine removes the regular loader it emits and sets <code>firmware='efi'</code> instead.)</td></tr>
   <tr><td><code>&lt;vsock model='virtio'&gt;</code></td><td>Optional guest↔host channel (useful for agent traffic). SNP attestation itself does <strong>not</strong> need vsock — the report is generated in-guest by the PSP, not via a host daemon.</td></tr>
   <tr><td><code>&lt;memtune&gt;&lt;hard_limit&gt;</code></td><td>Hard memory limit slightly above guest RAM (firmware + overhead).</td></tr>
   <tr><td><code>&lt;resource&gt;&lt;partition&gt;/machine</code></td><td>Resource partitioning for the confidential guest.</td></tr>
@@ -503,10 +503,11 @@ virsh dumpxml snp-guest | grep -E 'launchSecurity|vsock|policy'</pre>
 <ol>
   <li><strong>Generates the first report:</strong></li>
 </ol>
-<pre>   snpguest report   (in guest workdir /root/snp-attest)</pre>
+<pre>   snpguest report report.dat request-data.txt --random
+       (in guest workdir /root/snp-attest)</pre>
 <ul>
   <li><em>Why:</em> this is the in-guest report generator. It asks the CPU's PSP for a 4000-byte attestation report (signed with the VCEK) and writes <code>report.dat</code>. Success here proves the entire report path works: guest → GHCB → PSP → signed report.</li>
-  <li>The script then <strong>verifies</strong> the report in-guest with <code>snpguest verify</code> (ARK → ASK → VCEK chain, signature, TCB, VMPL, <code>report_data</code> binding) so you see a green local check before the remote appraisal.</li>
+  <li>The script then <strong>verifies</strong> the report in-guest with <code>snpguest verify attestation /root/snp-attest/certs report.dat</code> (ARK → ASK → VCEK chain, signature, TCB, VMPL, <code>report_data</code> binding) so you see a green local check before the remote appraisal. The cert directory is shipped from the host store by <code>setup-guest</code>; without it the in-guest check is skipped (it is informational — CoCo-AS verifies host-side anyway).</li>
 </ul>
 <p class="caption"><strong>Verify (inside guest):</strong></p>
 <pre>ls -la /root/snp-attest/report.dat</pre>

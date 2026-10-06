@@ -30,9 +30,9 @@ collateral_via_offline() {
     log "Collateral source: offline certificate store (${SNP_CERT_DIR})"
     if [[ ! -s "$SNP_ARK_CERT" || ! -s "$SNP_VCEK_CERT" ]]; then
         die "Offline mode requires a populated certificate store.
-Import the ARK/ASK/VCEK chain first (on a machine with KDS access):
-  snphost fetch --kds-url ${KDS_URL}
-  snphost export --out ${SNP_CERT_DIR}
+Fetch the ARK/ASK/VCEK chain first (on a machine with KDS access):
+  snphost fetch ca pem ${SNP_CERT_DIR}
+  snphost fetch vcek pem ${SNP_CERT_DIR}
 then copy ${SNP_CERT_DIR} to this host, or re-run with --collateral kds."
     fi
     log "Offline certificate store present: ${SNP_ARK_CERT}"
@@ -42,45 +42,36 @@ then copy ${SNP_CERT_DIR} to this host, or re-run with --collateral kds."
 # Idempotent: re-fetches are safe (the chain is overwritten).
 fetch_kds_certs() {
     require_cmd snphost
-    local url
-    url=$(kds_url)
-    [[ -n "$url" ]] || die "No KDS URL configured (--kds-url)"
     mkdir -p "$SNP_CERT_DIR"
-    log "Fetching AMD certificate chain (ARK/ASK/VCEK) from KDS: ${url}"
-    # 'snphost fetch' downloads the chain for this platform's chip ID and
-    # writes it to the default store; we then normalize it into SNP_CERT_DIR.
-    if ! run snphost fetch --kds-url "$url"; then
-        warn "snphost fetch from KDS failed (network? wrong KDS URL?)."
-        warn "If this host is air-gapped, use --collateral offline with a pre-imported store."
+    # snphost has no --kds-url flag: 'fetch ca' / 'fetch vcek' always talk to
+    # AMD's KDS, and they write ark.pem / ask.pem / vcek.pem straight into the
+    # target directory — exactly the layout SNP_*_CERT expects, so no
+    # post-fetch normalization is needed.
+    if [[ "$KDS_URL" != "https://kdsintf.amd.com/vcek/v1/SEV_SNP" ]]; then
+        warn "--kds-url (${KDS_URL}) is not honoured by 'snphost fetch' (it has no such option);"
+        warn "it is only used for the CoCo-AS collateral_service setting and the reachability probe."
+    fi
+    log "Fetching the AMD CA chain (ARK/ASK) from KDS into ${SNP_CERT_DIR}"
+    if ! run snphost fetch ca pem "$SNP_CERT_DIR"; then
+        warn "snphost fetch ca failed (network? KDS unreachable?)."
+        warn "If this host is air-gapped, use --collateral offline with a pre-populated store."
         return 1
     fi
-    # Normalize the fetched chain into the expected store layout.
-    local src
-    if [[ -s "$SNP_ARK_CERT" && -s "$SNP_VCEK_CERT" ]]; then
-        log "Certificate chain already in place: ${SNP_ARK_CERT}"
-    else
-        # 'snphost' may write to its own default location; copy whatever it
-        # produced into our canonical store so the rest of the script (and
-        # CoCo-AS) can find it at a stable path.
-        for src in /var/lib/sev/certs /var/lib/snp /run/sev-snp; do
-            if [[ -d "$src" ]]; then
-                log "Copying fetched chain from ${src} to ${SNP_CERT_DIR}"
-                run cp -f "${src}"/*.pem "${SNP_CERT_DIR}/" 2>/dev/null || true
-                break
-            fi
-        done
+    log "Fetching this platform's VCEK from KDS into ${SNP_CERT_DIR}"
+    if ! run snphost fetch vcek pem "$SNP_CERT_DIR"; then
+        warn "snphost fetch vcek failed (network? KDS unreachable?)."
+        warn "If this host is air-gapped, use --collateral offline with a pre-populated store."
+        return 1
     fi
     # Verify the chain end-to-end (ARK -> ASK -> VCEK, ECDSA P-384).
-    if run snphost verify certs; then
+    if run snphost verify certs "$SNP_CERT_DIR"; then
         log "Certificate chain verified (ARK -> ASK -> VCEK)"
     else
         warn "Certificate chain verification reported a problem (see snphost output)."
     fi
-    # Turin+ platforms also carry a VLEK hashstick; load + verify when present.
-    if snphost vlek-load >/dev/null 2>&1; then
-        if snphost verify vlek-hashstick >/dev/null 2>&1; then
-            log "VLEK hashstick loaded and verified (Turin+ platform)"
-        fi
+    # Turin+ platforms also carry a VLEK hashstick; verify it when present.
+    if snphost verify vlek-hashstick >/dev/null 2>&1; then
+        log "VLEK hashstick verified (Turin+ platform)"
     fi
     return 0
 }

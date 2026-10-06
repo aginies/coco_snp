@@ -482,7 +482,7 @@ sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso
      `virt-install --name … --memory … --vcpus … --disk … --cpu
      host-passthrough --network network=default,model=virtio --graphics
      vnc,listen=… --video virtio --boot cdrom,hd --machine q35 --location <ISO>
-     --extra-args console=ttyS0,115200 --print-xml` — i.e. **XML generation
+     --extra-args console=ttyS0,115200 --print-xml 1` — i.e. **XML generation
      only, nothing is started**. The script then applies a post-define SNP
      patch (below) and defines + starts the domain **once** — so the SNP
      configuration is in place *before* the first boot.
@@ -493,8 +493,8 @@ sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso
 
    | XML element | Why it's required |
    | --- | --- |
-   | `<launchSecurity type='sev-snp'>` + `<policy>` + `<vms>` | Tells libvirt/QEMU to launch this VM as an SEV-SNP confidential VM. The `policy` (default `0x30000`) is the launch policy; `vms` is the VMPL (0 = guest OS). **This element is what makes libvirt auto-select the SNP firmware and set up the writable NVRAM.** |
-   | (no explicit `<loader>`) | The SNP firmware is selected by libvirt's firmware autoselection from the `amd-sev-snp` descriptor once `launchSecurity type='sev-snp'` is present. Forcing a pflash loader without a matching NVRAM template would break the VM. (The virt-install engine *removes* the regular loader it emits.) |
+   | `<launchSecurity type='sev-snp'>` + `<policy>` | Tells libvirt/QEMU to launch this VM as an SEV-SNP confidential VM. The `policy` (default `0x30000`) is the launch policy. **This element is what narrows libvirt's firmware autoselection to the SNP firmware.** (libvirt's sev-snp schema has no VMPL element — the guest OS runs at VMPL 0.) |
+   | `<os firmware='efi'>` and no explicit `<loader>` | `firmware='efi'` is what switches libvirt into firmware autoselection; `launchSecurity type='sev-snp'` then narrows it to the `amd-sev-snp` descriptor and sets up the writable NVRAM. Dropping the loader *without* `firmware='efi'` leaves the domain on SeaBIOS and it will not boot. (The virt-install engine removes the regular loader it emits and sets `firmware='efi'` instead.) |
    | `<vsock model='virtio'>` | Optional guest↔host channel (useful for agent traffic). SNP attestation itself does **not** need vsock — the report is generated in-guest by the PSP, not via a host daemon. |
    | `<memtune><hard_limit>` | Hard memory limit slightly above guest RAM (firmware + overhead). |
    | `<resource><partition>/machine` | Resource partitioning for the confidential guest. |
@@ -651,16 +651,20 @@ sudo ./snp-attest.sh setup-guest --guest-ip <GUEST_IP>
 8. **Generates the first report:**
 
    ```
-   snpguest report   (in guest workdir /root/snp-attest)
+   snpguest report report.dat request-data.txt --random
+       (in guest workdir /root/snp-attest)
    ```
 
     - *Why:* this is the in-guest report generator. It asks the CPU's PSP for
       a 4000-byte attestation report (signed with the VCEK) and writes
       `report.dat`. Success here proves the entire report path works:
       guest → GHCB → PSP → signed report.
-    - The script then **verifies** the report in-guest with `snpguest verify`
-      (ARK → ASK → VCEK chain, signature, TCB, VMPL, `report_data` binding) so
-      you see a green local check before the remote appraisal.
+    - The script then **verifies** the report in-guest with `snpguest verify
+      attestation /root/snp-attest/certs report.dat` (ARK → ASK → VCEK chain,
+      signature, TCB, VMPL, `report_data` binding) so you see a green local
+      check before the remote appraisal. The cert directory is shipped from
+      the host store by `setup-guest`; without it the in-guest check is
+      skipped (it is informational — CoCo-AS verifies host-side anyway).
 
 **Verify (inside guest):**
 
