@@ -2,7 +2,7 @@
 # =============================================================================
 # snp-attest.sh — AMD SEV-SNP attestation test & setup
 #
-# Copyright (C) 2026 aginies
+# Copyright (C) 2026 SUSE
 # SPDX-License-Identifier: GPL-3.0-only
 #
 # This program is free software: you can redistribute it and/or modify it

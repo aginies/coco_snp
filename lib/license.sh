@@ -15,7 +15,7 @@
 
 readonly LICENSE_PROGRAM="snp-attest"
 readonly LICENSE_YEAR="2026"
-readonly LICENSE_AUTHOR="aginies"
+readonly LICENSE_AUTHOR="SUSE"
 readonly LICENSE_FILE="${SCRIPT_DIR}/LICENSE"
 
 # Classic 4-line notice (printed at startup in interactive mode).
