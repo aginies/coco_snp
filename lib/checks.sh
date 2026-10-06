@@ -87,6 +87,44 @@ check_kvm() {
     fi
 }
 
+# Boot parameters that enable SEV-SNP on the host: kvm_amd must be loaded
+# with sev_snp=1 and the AMD IOMMU must be on. The effective module
+# parameter lives in /sys/module/kvm_amd/parameters/sev_snp (covers both the
+# kernel command line and /etc/modprobe.d); /proc/cmdline is scanned as a
+# fallback when the module is not loaded yet.
+check_boot_params() {
+    local cmdline sev_snp="" modprobe_opts
+    cmdline=$(tr ' ' '\n' < /proc/cmdline 2>/dev/null || true)
+    if [[ -r /sys/module/kvm_amd/parameters/sev_snp ]]; then
+        sev_snp=$(cat /sys/module/kvm_amd/parameters/sev_snp)
+    fi
+    modprobe_opts=$(grep -hiE '^[[:space:]]*options[[:space:]]+kvm_amd([[:space:]]|$)' /etc/modprobe.d/*.conf 2>/dev/null || true)
+
+    if [[ "$sev_snp" == "Y" ]]; then
+        record "PASS" "Boot params: kvm_amd loaded with sev_snp=1"
+    elif [[ "$sev_snp" == "N" ]]; then
+        record "FAIL" "Boot params: kvm_amd loaded with sev_snp=N" \
+            "Add 'options kvm_amd sev_snp=1' to /etc/modprobe.d/kvm.conf (or kvm_amd.sev_snp=1 on the kernel cmdline), then: modprobe -r kvm_amd && modprobe kvm_amd"
+    elif grep -qxF 'kvm_amd.sev_snp=1' <<<"$cmdline" || grep -q 'sev_snp=1' <<<"$modprobe_opts"; then
+        record "WARN" "Boot params: sev_snp=1 configured but kvm_amd not loaded" \
+            "modprobe kvm_amd; check 'dmesg | grep -i sev'"
+    else
+        record "FAIL" "Boot params: kvm_amd.sev_snp=1 not set" \
+            "Add 'options kvm_amd sev_snp=1' to /etc/modprobe.d/kvm.conf (or kvm_amd.sev_snp=1 on the kernel cmdline), then reload kvm_amd or reboot"
+    fi
+
+    # AMD IOMMU is required for SEV-SNP. Non-empty /sys/kernel/iommu_groups
+    # proves it is active even without an explicit cmdline parameter.
+    if [[ -n "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]]; then
+        record "PASS" "Boot params: AMD IOMMU enabled"
+    elif grep -qxF 'amd_iommu=on' <<<"$cmdline"; then
+        record "PASS" "Boot params: amd_iommu=on in /proc/cmdline"
+    else
+        record "WARN" "Boot params: AMD IOMMU not detected (required for SEV-SNP)" \
+            "Add 'amd_iommu=on iommu=pt' to the kernel cmdline (GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub), then reboot"
+    fi
+}
+
 # libvirt is modular since SLE 16 / libvirt 5.7: the monolithic libvirtd.service
 # is replaced by per-driver daemons (virtqemud, virtnetworkd, virtstoraged),
 # normally socket-activated. The functional probe below covers both layouts.
@@ -345,11 +383,12 @@ cmd_check_platform() {
 cmd_check() {
     log "=== SEV-SNP host capability check ==="
     step "Probe host for SEV-SNP readiness (read-only, no changes made)" \
-        "Checks CPU/BIOS SEV-SNP, KVM, libvirt, QEMU, guestfs-tools, /dev/sev, snphost, Trustee services, ports, KDS reachability."
+        "Checks CPU/BIOS SEV-SNP, KVM, boot params (kvm_amd sev_snp, IOMMU), libvirt, QEMU, guestfs-tools, /dev/sev, snphost, Trustee services, ports, KDS reachability."
     CHECK_RESULTS=()
 
     check_cpu_snp
     check_kvm
+    check_boot_params
     check_libvirt
     check_qemu
     check_virt_customize

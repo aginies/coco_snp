@@ -244,6 +244,7 @@ strictly required.
 | --- | --- | --- |
 | CPU SEV-SNP flag | `grep /proc/cpuinfo` | Hardware must advertise `sev_snp`. Fallback: `/dev/sev` SNP ioctl support. |
 | KVM | `stat /dev/kvm` | No `/dev/kvm` → no VMs at all. |
+| Boot params (SEV-SNP) | `/proc/cmdline` + `/sys/module/kvm_amd/parameters/sev_snp` | The kernel/boot side of enabling SNP: `kvm_amd` must be loaded with `sev_snp=1` (cmdline or `/etc/modprobe.d`), and the AMD IOMMU must be on (`amd_iommu=on`). |
 | libvirt | `virsh -c qemu:///system version` | A successful connection proves libvirt works (modular `virtqemud` or monolithic). |
 | QEMU version | `qemu-system-x86_64 --version` | SEV-SNP support requires QEMU ≥ 8.0. |
 | virt-customize | `command -v virt-customize` | guestfs-tools does the offline SSH-key injection in `setup-vm`. WARN only. |
