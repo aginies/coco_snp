@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AMD SEV-SNP Attestation — Step-by-Step Guide</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <a href="#prerequisites-before-any-script-command"><span class="n">•</span>Prerequisites</a>
+  <a href="#detailed-steps-14-host-setup-individual"><span class="n">1</span>Detailed Steps 1–4 (host setup, individual)</a>
+  <a href="#step-5--install-the-guest-os-manual"><span class="n">5</span>Install the guest OS (manual)</a>
+  <a href="#step-6--set-up-the-guest-inside-the-snp-vm"><span class="n">6</span>Set up the guest (inside the SNP VM)</a>
+  <a href="#step-7--perform-remote-attestation"><span class="n">7</span>Perform remote attestation</a>
+  <a href="#step-8--secret-delivery"><span class="n">8</span>Secret delivery</a>
+  <a href="#step-9--verify-everything-is-consistent-any-time"><span class="n">9</span>Verify everything is consistent (any time)</a>
+  <a href="#step-10--cleanup-when-done"><span class="n">10</span>Cleanup (when done)</a>
+  <a href="#step-11--air-gapped--offline-setup-optional"><span class="n">11</span>Air-gapped / Offline Setup (optional)</a>
+  <a href="#appendix--jwt--ear-tokens"><span class="n">§</span>Appendix</a>
+  <a href="#troubleshooting-map"><span class="n">!</span>Troubleshooting</a>
+  <a href="#acronym-glossary"><span class="n">Aa</span>Glossary</a>
+</nav>
+
+
+<main>
+
+<header class="hero">
+  <h1>AMD SEV-SNP Attestation — Step-by-Step Guide</h1>
+  <p>Version 1.0.0</p>
+</header>
+
+
+
+<p>A guided walkthrough of how to set up and run AMD SEV-SNP attestation using <code>snp-attest.sh</code>. The installation layer is distribution-pluggable (<code>lib/distros/</code>), but for now only SLES/openSUSE are implemented.</p>
+<p>Each step explains <strong>what</strong> happens, <strong>why</strong> it is needed, and <strong>how to verify</strong> it worked.</p>
+<div class="callout info">
+  <span class="tag">Two sides to this process</span>
+  The whole process has two sides:
+</div>
+<ul>
+  <li><strong>HOST</strong> — the physical machine running the hypervisor. All commands in this guide run here (guest commands are executed remotely over SSH).</li>
+  <li><strong>GUEST</strong> — the virtual machine that becomes an <strong>SEV-SNP confidential VM</strong>: its memory is encrypted <em>and</em> integrity-protected by the AMD SEV-SNP hardware, and its launch state is measured into a single <strong>launch digest</strong> that the CPU's PSP signs into an attestation report.</li>
+</ul>
+<div class="callout info">
+  <strong>SEV-SNP vs Intel TDX in one paragraph.</strong> Both are confidential-VM technologies, but the attestation data path is different. In TDX the guest cannot sign its own quote — it asks a <strong>host-side QGS</strong> service to sign a TD Report over vsock, and verification pulls PCK collateral from Intel PCS. In SEV-SNP the <strong>CPU's PSP signs the report in-guest</strong> (over the GHCB channel) with a <strong>VCEK</strong> derived from the launch measurement — there is no host quote daemon, no vsock quote path, and no per-platform registration. Collateral (the ARK → ASK → VCEK chain) comes from <strong>AMD KDS</strong>. That removes an entire setup step (no <code>setup-qgs</code>) and a whole class of host-side quote bugs.
+</div>
+<hr>
+<h2 id="quick-start--10-commands-on-a-ready-host">Quick Start — 10 commands on a ready host</h2>
+<p><strong>Goal in one sentence:</strong> prove to a remote verifier that the guest is a genuine, untampered SEV-SNP confidential VM, and only then hand it a secret.</p>
+<p class="caption"><strong>The happy path (10 commands):</strong></p>
+<pre># 1. Host preparation &amp; capability check
+sudo ./snp-attest.sh check
+
+sudo ./snp-attest.sh setup-host
+sudo ./snp-attest.sh setup-trustee
+sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso
+
+# 2. Manual: install SLES in the VM
+virsh console snp-guest                    # install from ISO (or any other viewer)
+sudo ./snp-attest.sh show-vm-info              # get GUEST_IP
+
+# 3. Guest preparation + attestation
+sudo ./snp-attest.sh setup-guest --guest-ip &lt;GUEST_IP&gt;
+sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv
+
+# 4. Secret delivery
+sudo ./snp-attest.sh secret-set --file /tmp/my-secret --path default/test/secret
+sudo ./snp-attest.sh secret-get --guest-ip &lt;GUEST_IP&gt; --path default/test/secret</pre>
+<div class="callout info">
+  <strong>Prerequisites before starting:</strong>  - AMD EPYC CPU with SEV-SNP (Rome / Genoa / Turin or later) - SEV-SNP enabled in BIOS (the CPU must report <code>sev_snp</code>) - SLES 16.1 installer ISO (from SUSE Customer Center) - Internet access to AMD KDS (or a local offline certificate store) - <a href="#prerequisites-before-any-script-command">Full prerequisites →</a>
+</div>
+<hr>
+<h2 id="attestation-flow-remote-path-as-driven-by-this-guide">Attestation flow (remote path, as driven by this guide)</h2>
+<ol>
+  <li><strong>Guest:</strong> <code>snpguest report</code> (or <code>snp-report-gen</code>) asks the <strong>CPU's PSP</strong> for a 4000-byte attestation report over the GHCB channel. The PSP signs it with the <strong>VCEK</strong> — no host involvement, no vsock.</li>
+  <li><strong>Guest → Host (HTTP:8080):</strong> <code>kbs-client</code> submits the report to KBS (Method A), or the host fetches the report over SSH and submits it to CoCo-AS with <code>grpcurl</code> (the <code>attest</code> command / Method B).</li>
+  <li><strong>Host:</strong> KBS delegates report verification to CoCo-AS.</li>
+  <li><strong>Host:</strong> CoCo-AS fetches the <strong>ARK → ASK → VCEK</strong> chain from <strong>AMD KDS</strong> (remote) — or from the local offline certificate store when run with <code>--collateral offline</code>.</li>
+  <li><strong>Host:</strong> CoCo-AS verifies the report signature against the VCEK, checks the reported TCB against KDS, and compares the launch identity (<code>id_block</code>, <code>id_auth</code>, <code>launch_digest</code>) against reference values from RVPS, then signs an EAR token.</li>
+  <li><strong>Host:</strong> KBS evaluates its resource policy (Rego) against the EAR token claims.</li>
+  <li><strong>Host → Guest (HTTP:8080):</strong> KBS releases the secret to <code>kbs-client</code>.</li>
+</ol>
+<div class="callout info">
+  <span class="tag">Note</span>
+  the <code>snp-attest.sh</code> script drives the guest over <strong>ssh</strong> (<code>setup-guest</code>, <code>attest</code>, <code>secret-get</code>). The attestation data path itself is the in-guest report (PSP-signed) + HTTP (KBS). There is <strong>no vsock quote channel</strong> — that is a TDX/QGS artifact, not an SEV-SNP one.
+</div>
+<hr>
+<h2 id="choose-your-path">Choose your path</h2>
+<table>
+  <tr><th>I want to…</th><th>Use this</th></tr>
+  <tr><td>Get everything running in one shot</td><td><code>./snp-attest.sh all --guest-iso …</code> → <a href="#step-5--install-the-guest-os-manual">jump to Step 5</a></td></tr>
+  <tr><td>Understand each layer individually</td><td><a href="#one-shot-setup-snp-attestsh-all">Steps 1–4</a> below</td></tr>
+  <tr><td>Debug a broken setup</td><td><a href="#troubleshooting-map">Troubleshooting</a></td></tr>
+  <tr><td>Validate the KDS cert chain + TCB (deep check)</td><td><code>./snp-attest.sh check --check-platform</code></td></tr>
+  <tr><td>Convert an existing (non-SNP) VM to SNP</td><td><code>./snp-attest.sh convert-snp --convert-vm &lt;VM&gt;</code></td></tr>
+  <tr><td>Run in an air-gapped / offline environment</td><td><code>--collateral offline</code> (local cert store)</td></tr>
+</table>
+<hr>
+<h2 id="what-each-step-actually-changes">What each step actually changes</h2>
+<table>
+  <tr><th>Step</th><th>Changes on disk?</th><th>Changes network?</th><th>Requires reboot?</th><th>Can be skipped?</th></tr>
+  <tr><td><a href="#step-1--check-host-capabilities">1. Check host capabilities</a></td><td>No</td><td>No</td><td>No</td><td>No (safety gate)</td></tr>
+  <tr><td><a href="#step-2--set-up-the-host-snphost--kds-collateral">2. setup-host (snphost + KDS collateral)</a></td><td>Yes (packages, cert store)</td><td>No</td><td>No</td><td>Only if already done</td></tr>
+  <tr><td><a href="#step-3--set-up-trustee-attestation--secrets">3. setup-trustee (attestation + secrets)</a></td><td>Yes (3 configs, keys, policy)</td><td>Yes (ports 3000/8080)</td><td>No</td><td>Only if already done</td></tr>
+  <tr><td><a href="#step-4--create-the-snp-vm">4. setup-vm (create SNP VM)</a></td><td>Yes (disk, XML)</td><td>No</td><td>No</td><td>Only if already done</td></tr>
+  <tr><td><a href="#step-5--install-the-guest-os-manual">5. Install guest OS</a></td><td>Yes (guest disk)</td><td>No</td><td>Yes (guest)</td><td><strong>No</strong></td></tr>
+  <tr><td><a href="#step-6--set-up-the-guest-inside-the-snp-vm">6. setup-guest (guest config)</a></td><td>Yes (guest config)</td><td>No</td><td>No</td><td>Only if already done</td></tr>
+  <tr><td><a href="#step-7--perform-remote-attestation">7. attest (remote attestation)</a></td><td>No (read-only)</td><td>Yes (guest→KDS→CoCo-AS)</td><td>No</td><td>Only if already done</td></tr>
+  <tr><td><a href="#step-8--secret-delivery">8. secret-get (secret delivery)</a></td><td>No</td><td>Yes (guest→KBS)</td><td>No</td><td>Only if already done</td></tr>
+  <tr><td><a href="#step-9--verify-everything-is-consistent-any-time">9. verify (consistency check)</a></td><td>No</td><td>No</td><td>No</td><td><strong>Recommended anytime</strong></td></tr>
+  <tr><td><a href="#step-10--cleanup-when-done">10. clean (cleanup)</a></td><td>Yes (destroys VM)</td><td>No</td><td>No</td><td>Only when done</td></tr>
+  <tr><td><a href="#step-11--air-gapped--offline-setup-optional">11. Air-gapped / offline setup</a></td><td>Yes (local cert store)</td><td>No (local)</td><td>No</td><td><strong>Yes</strong> (only for offline hosts)</td></tr>
+</table>
+<hr>
+<h2 id="source-code">Source Code</h2>
+<p>The source code for these scripts is hosted on GitHub:</p>
+<ul>
+  <li><strong>Repository:</strong> <a href="https://github.com/aginies/coco_snp">https://github.com/aginies/coco_snp</a></li>
+  <li><strong>Tarball:</strong> <a href="https://github.com/aginies/coco_snp/releases">https://github.com/aginies/coco_snp/releases</a> (when available)</li>
+</ul>
+<h3 id="getting-the-scripts">Getting the scripts</h3>
+<p class="caption"><strong>Option 1 — Clone the repository (recommended for development or latest changes):</strong></p>
+<pre>git clone https://github.com/aginies/coco_snp.git
+cd coco_snp</pre>
+<p>This gives you the full history, all branches, and the ability to update with <code>git pull</code>.</p>
+<p class="caption"><strong>Option 2 — Download a specific release tarball:</strong></p>
+<pre>VERSION="1.0.0"
+curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
+tar xzf coco_snp-${VERSION}.tar.gz
+cd coco_snp-${VERSION}</pre>
+<p>The tarball contains a versioned subdirectory with all scripts, the library, and documentation — ready to use without Git.</p>
+<p class="caption"><strong>Option 3 — Download a single branch or tag:</strong></p>
+<pre># Download a specific tag without cloning the full repo
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.0.tar.gz"
+tar xzf v1.0.0.tar.gz
+cd coco_snp-1.0.0</pre>
+<hr>
+<h2 id="prerequisites-before-any-script-command">Prerequisites <span>(before any script command)</span></h2>
+<table>
+  <tr><th>Requirement</th></tr>
+  <tr><td>AMD EPYC CPU with SEV-SNP (Rome / Genoa / Turin or later)</td></tr>
+  <tr><td>SEV-SNP enabled in BIOS (CPU must report <code>sev_snp</code>)</td></tr>
+  <tr><td>Linux host (SLES 16.1 is the reference target)</td></tr>
+  <tr><td>Internet access to AMD KDS</td></tr>
+  <tr><td><code>kvm_amd</code> loaded with SEV-SNP support (the CPU exposes <code>/dev/sev</code>)</td></tr>
+</table>
+<p class="caption"><strong>What to prepare before you start:</strong></p>
+<table>
+  <tr><th>Item</th><th>Where to get it</th><th>Needed for</th></tr>
+  <tr><td>SLES 16.1 installer ISO</td><td>SUSE Customer Center (subscription)</td><td><code>setup-vm</code> / <code>all</code> (<code>--guest-iso</code>) and the manual install in Step 5</td></tr>
+</table>
+<div class="callout info">
+  <strong>No platform registration needed.</strong> Unlike Intel TDX (Xeon 6 / Scalable platforms must be registered before PCK certificates are issued), SEV-SNP needs <strong>no per-platform registration</strong>. The VCEK is derived from the VM's launch measurement and chained to AMD's public ARK/ASK root — fetched from KDS. If <code>check</code> reports the CPU does not advertise SEV-SNP, the fix is a BIOS setting, not a registration.
+</div>
+<p>If BIOS SEV-SNP is off, nothing later will work — the CPU will not report <code>sev_snp</code> and <code>/dev/sev</code> will not support the SNP ioctls.</p>
+<hr>
+<h2 id="one-shot-setup-snp-attestsh-all">One-shot setup: <code>snp-attest.sh all</code></h2>
+<p>Instead of running Steps 1–4 one by one, a single command chains them:</p>
+<pre>sudo ./snp-attest.sh all --guest-iso /path/to/SLE-16.1.x86_64.iso</pre>
+<p>It runs <code>check</code> → <code>setup-host</code> → <code>setup-trustee</code> → <code>setup-vm</code> in order, <strong>stops on the first hard failure</strong> (the capability check aborts before anything is installed), and finishes with a <code>verify</code> audit of the host-side configuration.</p>
+<ul>
+  <li><em>When to use it:</em> a fresh host where you want the complete stack up in one go.</li>
+  <li><em>When to use the individual steps instead:</em> debugging a specific layer, or re-running after a partial failure — every step is idempotent, so re-running just the failed one is safe.</li>
+</ul>
+<p><code>all</code> stops at VM start: the manual guest OS install (Step 5) and everything after it (Steps 6–8) still have to be done by hand. <strong>If you used <code>all</code>, skip straight to Step 5</strong> — Steps 1–4 below are only for running things individually.</p>
+<hr>
+<div class="step" id="detailed-steps-14-host-setup-individual">
+<h2>Detailed Steps 1–4 (host setup, individual)</h2>
+<div class="callout info">
+  <strong>Skip this section if you used <code>snp-attest.sh all</code>.</strong> These are the individual commands for when you want to run each layer one-by-one (debugging, custom setups, incremental re-runs).
+</div>
+</div>
+
+<div class="step" id="step-1--check-host-capabilities">
+<h3><span class="step-badge">Step 1</span>Check host capabilities</h3>
+<p class="caption"><strong>Command:</strong></p>
+<pre>sudo ./snp-attest.sh check</pre>
+<p><strong>What it does:</strong> runs read-only probes. No changes are made; root is not strictly required.</p>
+<p class="caption"><strong>Why each probe exists:</strong></p>
+<table>
+  <tr><th>Probe</th><th>Tool</th><th>Why we check it</th></tr>
+  <tr><td>CPU SEV-SNP flag</td><td><code>grep /proc/cpuinfo</code></td><td>Hardware must advertise <code>sev_snp</code>. Fallback: <code>/dev/sev</code> SNP ioctl support.</td></tr>
+  <tr><td>KVM</td><td><code>stat /dev/kvm</code></td><td>No <code>/dev/kvm</code> → no VMs at all.</td></tr>
+  <tr><td>libvirt</td><td><code>virsh -c qemu:///system version</code></td><td>A successful connection proves libvirt works (modular <code>virtqemud</code> or monolithic).</td></tr>
+  <tr><td>QEMU version</td><td><code>qemu-system-x86_64 --version</code></td><td>SEV-SNP support requires QEMU ≥ 8.0.</td></tr>
+  <tr><td>virt-customize</td><td><code>command -v virt-customize</code></td><td>guestfs-tools does the offline SSH-key injection in <code>setup-vm</code>. WARN only.</td></tr>
+  <tr><td>QEMU SEV-SNP object</td><td><code>qemu-system-x86_64 -object help</code></td><td>SEV-SNP is a QEMU <em>object</em> (<code>sev-snp-guest</code>), not a machine type — so we probe the object list, not <code>-machine help</code>.</td></tr>
+  <tr><td>SNP OVMF firmware</td><td>scan <code>/usr/share/qemu/firmware/*.json</code></td><td>A SNP-capable UEFI firmware (feature <code>amd-sev-snp</code>) must exist to boot the confidential VM.</td></tr>
+  <tr><td><code>/dev/sev</code></td><td><code>stat /dev/sev</code></td><td>The SEV-SNP host device. Absent → <code>kvm_amd</code> not loaded with SNP, or BIOS off.</td></tr>
+  <tr><td>snphost package</td><td><code>rpm -qa</code></td><td>The host-side SNP verifier (reads the ARK/ASK/VCEK chain).</td></tr>
+  <tr><td>Trustee services</td><td><code>systemctl</code> ×3</td><td>Attestation stack (grpc-as, kbs, rvps; Step 3).</td></tr>
+  <tr><td>Ports 3000/8080</td><td><code>ss -tln</code></td><td>CoCo-AS and KBS must listen.</td></tr>
+  <tr><td>KDS reachability</td><td><code>curl -sI</code></td><td>AMD KDS is where the ARK/ASK/VCEK chain comes from (or the local store in offline mode).</td></tr>
+</table>
+<p><strong>Expected result:</strong> all rows PASS (WARN is non-fatal).</p>
+<p><strong>If FAIL:</strong> read the HINT column — it tells you the exact fix (BIOS setting, package to install, service to start).</p>
+<div class="callout info">
+  <strong>Tip — deep platform validity check:</strong> run <code>sudo ./snp-attest.sh check --check-platform</code> (or the standalone <code>check-platform</code> command) to fetch the full ARK → ASK → VCEK chain from AMD KDS and verify the chain + TCB OIDs with <code>snphost</code>. Unlike TDX, there is no per-platform <em>registration</em> to validate — SEV-SNP has no PCK certificates — so this is a pure collateral/TCB check, not a "is my platform registered" check.
+</div>
+<hr>
+</div>
+
+<div class="step" id="step-2--set-up-the-host-snphost--kds-collateral">
+<h3><span class="step-badge">Step 2</span>Set up the host (snphost + KDS collateral)</h3>
+<p class="caption"><strong>Command:</strong></p>
+<pre>sudo ./snp-attest.sh setup-host</pre>
+<p class="caption"><strong>What it does, in order:</strong></p>
+<ol>
+  <li><strong>Installs the <code>snphost</code> package</strong> (the host-side SEV-SNP verifier) via <code>zypper</code>, adding the Virtualization:SGX OBS repository if the package is not in the default SLES 16.1 repos.</li>
+</ol>
+<ul>
+  <li><em>Why:</em> <code>snphost</code> is what verifies an SNP report's signature against the ARK → ASK → VCEK chain and checks the reported TCB. It is the SEV-SNP counterpart of Intel's DCAP quote-verification libraries.</li>
+  <li>The script only installs what's missing (<code>rpm -q</code> first), so re-runs are quiet.</li>
+</ul>
+<ol>
+  <li><strong>Verifies the host is SEV-SNP capable</strong> (<code>/dev/sev</code> present, CPU reports <code>sev_snp</code>).</li>
+</ol>
+<ul>
+  <li><em>Why:</em> sanity gate before going further. If this fails, no SNP VM can be launched and attestation is impossible.</li>
+</ul>
+<ol>
+  <li><strong>Fetches the AMD KDS certificate chain</strong> (ARK, ASK, VCEK) into the local store (<code>/var/lib/sev-snp/certs/</code>).</li>
+</ol>
+<ul>
+  <li><em>Why:</em> verification needs the root chain. In the default <code>kds</code> mode the chain is fetched from AMD's global KDS (<code>https://kdsintf.amd.com/vcek/v1/SEV_SNP</code>). In <code>offline</code> mode the store must already be populated (see <a href="#step-11--air-gapped--offline-setup-optional">Step 11</a>).</li>
+  <li><em>Why a local store:</em> CoCo-AS and <code>snphost</code> read the chain from disk at verification time; caching it locally also makes re-runs fast and lets an air-gapped host verify without internet.</li>
+</ul>
+<ol>
+  <li><strong>Ensures libvirt is running</strong> (enables <code>virtqemud.socket</code> etc. if needed).</li>
+</ol>
+<ul>
+  <li><em>Why:</em> Step 4 needs it to create the VM.</li>
+</ul>
+<ol>
+  <li><strong>Ensures <code>grpcurl</code> is available</strong> (installs the distro package or the official prebuilt binary).</li>
+</ol>
+<ul>
+  <li><em>Why:</em> Step 7 uses <code>grpcurl</code> to communicate directly with the CoCo-AS gRPC service for report appraisal.</li>
+</ul>
+<div class="callout info">
+  <strong>Tip — air-gapped / offline collateral:</strong> When the host cannot reach AMD KDS, import the certificate chain once while online (or from a trusted source) and use <code>--collateral offline</code>:  ``<code>bash sudo ./snp-attest.sh setup-host --collateral offline </code>`<code>  The offline store is </code>/var/lib/sev-snp/certs/{ark,ask,vcek}.pem`. See <a href="#step-11--air-gapped--offline-setup-optional">Step 11</a> for the full air-gapped flow.
+</div>
+<p class="caption"><strong>Verify:</strong></p>
+<pre>rpm -qa | grep -i snphost                       # package present
+ls -la /var/lib/sev-snp/certs/                  # ark/ask/vcek .pem present
+virsh -c qemu:///system version                 # libvirt answers</pre>
+<hr>
+</div>
+
+<div class="step" id="step-3--set-up-trustee-attestation--secrets">
+<h3><span class="step-badge">Step 3</span>Set up Trustee (attestation + secrets)</h3>
+<p class="caption"><strong>Command:</strong></p>
+<pre>sudo ./snp-attest.sh setup-trustee</pre>
+<p class="caption"><strong>Background — the attestation stack's three roles:</strong></p>
+<table>
+  <tr><th>Service</th><th>Role in one line</th></tr>
+  <tr><td><strong>CoCo-AS</strong> (<code>grpc-as</code>)</td><td>The verifier: checks the report's signature (VCEK) and launch identity, and returns an <strong>EAR token</strong> (a JWT containing the measured claims + an <code>allow</code> decision). For SEV-SNP it uses the <strong><code>snp_verifier</code></strong>.</td></tr>
+  <tr><td><strong>KBS</strong></td><td>The vault: stores secrets; releases one only to a client presenting a valid EAR token that passes the resource policy.</td></tr>
+  <tr><td><strong>RVPS</strong></td><td>The reference list: holds the expected launch identity (<code>id_block</code>, <code>id_auth</code>, <code>launch_digest</code>) CoCo-AS compares against.</td></tr>
+</table>
+<p class="caption"><strong>What it does, in order:</strong></p>
+<ol>
+  <li><strong>Installs <code>trustee</code> + the SNP verify libraries.</strong></li>
+</ol>
+<ul>
+  <li><em>Why:</em> provides the three services; the extra libs are what grpc-as links against for signature verification.</li>
+</ul>
+<ol>
+  <li><strong>Checks <code>ldd</code> on grpc-as.</strong></li>
+</ol>
+<ul>
+  <li><em>Why:</em> fail now on missing shared libraries instead of a service that crashes at runtime with an obscure log.</li>
+</ul>
+<ol>
+  <li><strong>Generates the CoCo-AS signer keypair (EC P-256), the JWKS file, and a self-signed X.509 certificate for the token's <code>x5c</code> chain.</strong></li>
+</ol>
+<ul>
+  <li><em>Why:</em> CoCo-AS signs EAR tokens with this key. If no persistent signer is configured, grpc-as uses an <em>ephemeral</em> key — tokens become unverifiable and KBS rejects everything. This SLE build of grpc-as doesn't serve a <code>/.well-known/jwks.json</code> endpoint, so the script derives the JWKS manually from the public key (openssl → x/y coordinates → JSON). KBS is pointed at it via <code>file://</code> (it rejects plain <code>http://</code>).</li>
+  <li><em>Why also a certificate:</em> the token header embeds the signing key as a <code>jwk</code>, and when it does, KBS <strong>requires</strong> a non-empty <code>x5c</code> chain that chains to <code>attestation_token.trusted_certs_paths</code> — otherwise it rejects the token ("neither trusted jwk set nor trusted pem public key works"). The script derives a self-signed cert from the signer key (<code>/etc/trustee/as-signer.crt</code>), points <code>grpc-as.json</code> <code>cert_path</code> at it, and lists it in <code>kbs.json</code> <code>trusted_certs_paths</code>.</li>
+</ul>
+<ol>
+  <li><strong>Generates the KBS admin keypair (ed25519).</strong></li>
+</ol>
+<ul>
+  <li><em>Why:</em> admin-mode operations (storing secrets, setting policy) authenticate with this key. Private key stays root-only; KBS only needs the public half.</li>
+</ul>
+<ol>
+  <li><strong>Writes the resource policy (Rego).</strong></li>
+</ol>
+<ul>
+  <li><em>Why:</em> this policy decides <em>which</em> attested clients may fetch <em>which</em> secrets. <strong>Warning:</strong> the script writes an <strong>allow-all</strong> policy — a lab default. For production, gate it on real claims (e.g. <code>snp.report.id_block</code> / <code>snp.report.launch_digest</code>).</li>
+</ul>
+<ol>
+  <li><strong>Writes the three config files:</strong></li>
+</ol>
+<ul>
+  <li><code>/etc/grpc-as.json</code> → CoCo-AS: storage dir, signer key, and the <strong><code>snp_verifier</code></strong> (so it appraises SEV-SNP reports, not TDX quotes).</li>
+  <li><code>/etc/kbs.json</code> → KBS: listen address, CoCo-AS address, JWKS file, policy path. (Lab settings: <code>insecure_http</code>, <code>InsecureAllowAll</code>.)</li>
+  <li><code>/etc/rvps.json</code> → RVPS: storage dir.</li>
+  <li><em>Why explicit configs:</em> every component must point at the same endpoints; inconsistent addresses are a classic silent failure.</li>
+</ul>
+<ol>
+  <li><strong>Overrides <code>kbs.service</code> and <code>grpc-as.service</code> ExecStart</strong> via drop-ins.</li>
+</ol>
+<ul>
+  <li><em>Why:</em> the packaged units don't pass the config file correctly (KBS omits <code>--config-file</code>; grpc-as's env var isn't expanded and uses a wrong flag name). Without the override, both run with built-in defaults → broken attestation.</li>
+</ul>
+<ol>
+  <li><strong>Starts services in dependency order:</strong> <code>rvps</code> → <code>grpc-as</code> → <em>wait for port 3000</em> → <code>kbs</code>.</li>
+</ol>
+<ul>
+  <li><em>Why this order:</em> KBS loads the JWKS file at startup, so CoCo-AS must be up first; the policy upload needs KBS up.</li>
+  <li><em>Note on <code>trustee.service</code>:</em> the monolithic <code>trustee.service</code> package unit is intentionally disabled. It is redundant with the dedicated <code>grpc-as</code>, <code>kbs</code>, and <code>rvps</code> services, and its unit requires <code>/etc/trustee.json</code> which is not used in this architecture.</li>
+</ul>
+<ol>
+  <li><strong>Uploads the resource policy to KBS</strong> with <code>kbs-client config set-resource-policy</code>.</li>
+</ol>
+<ul>
+  <li><em>Why:</em> KBS only enforces a policy that has been pushed into it.</li>
+</ul>
+<p class="caption"><strong>Verify:</strong></p>
+<pre>systemctl is-active grpc-as kbs rvps           # all active
+ss -tln | grep -E '3000|8080'                  # ports listening</pre>
+<div class="callout info">
+  <strong>Note — lab vs production:</strong> this setup is deliberately a <strong>lab configuration</strong>. Three things are permissive and must be changed for real use: (1) the resource policy is <strong>allow-all</strong> — any attested client can fetch any secret; in production, gate it on real claims (e.g. <code>snp.report.id_block</code>). (2) KBS runs with <code>insecure_http</code> + <code>InsecureAllowAll</code> — no TLS, no tenant isolation. (3) the host-mode <code>secret-get</code> (Method B) leaves the EAR token on the host, so anyone holding it can fetch the secret — use the in-guest <code>kbs-client</code> (Method A) for real secret gating.
+</div>
+<hr>
+</div>
+
+<div class="step" id="step-4--create-the-snp-vm">
+<h3><span class="step-badge">Step 4</span>Create the SNP VM</h3>
+<p class="caption"><strong>Command:</strong></p>
+<pre>sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso</pre>
+<p class="caption"><strong>Options (with defaults):</strong></p>
+<table>
+  <tr><th>Option</th><th>Default</th><th>Description</th></tr>
+  <tr><td><code>--guest-iso PATH</code></td><td><em>(mandatory)</em></td><td>Path to installer ISO</td></tr>
+  <tr><td><code>--vm-name NAME</code></td><td><code>snp-guest</code></td><td>Libvirt domain name</td></tr>
+  <tr><td><code>--vm-mem MB</code></td><td><code>16384</code></td><td>RAM in megabytes (16 GB)</td></tr>
+  <tr><td><code>--vm-cpu N</code></td><td><code>4</code></td><td>Number of vCPUs</td></tr>
+  <tr><td><code>--vm-disk SIZE</code></td><td><code>32G</code></td><td>Qcow2 disk size</td></tr>
+  <tr><td><code>--ssh-key PATH</code></td><td><code>~/.ssh/id_ed25519</code></td><td>SSH keypair to generate/inject</td></tr>
+  <tr><td><code>--virt-install</code> / <code>--no-virt-install</code></td><td><code>auto</code></td><td>VM creation engine: <code>virt-install</code> if available, else generated XML</td></tr>
+  <tr><td><code>--vnc-listen ADDR</code></td><td><code>0.0.0.0</code></td><td>VNC listen address (use <code>127.0.0.1</code> for host-local only)</td></tr>
+  <tr><td><code>--vnc-port PORT</code></td><td><code>5900</code></td><td>Fixed VNC port (instead of libvirt autoport)</td></tr>
+  <tr><td><code>--dry-run</code></td><td><em>(off)</em></td><td>Print the <code>virt-install</code> command without executing (no root needed)</td></tr>
+  <tr><td><code>--no-snp</code></td><td><em>(off)</em></td><td>Create regular non-SNP VM (for later <code>convert-snp</code>)</td></tr>
+</table>
+<p class="caption"><strong>What it does, in order:</strong></p>
+<ol>
+  <li><strong>Locates the SNP OVMF</strong> via QEMU firmware descriptors (feature <code>amd-sev-snp</code>) and <strong>confirms QEMU has the <code>sev-snp-guest</code> object.</strong></li>
+</ol>
+<ul>
+  <li><em>Why:</em> fail fast — creating a VM that can't be a confidential VM wastes the whole install cycle.</li>
+</ul>
+<ol>
+  <li><strong>Creates the qcow2 disk</strong> (32G default) — by <code>virt-install</code> itself when the virt-install engine is used, otherwise <code>qemu-img create</code>.</li>
+</ol>
+<ul>
+  <li><em>Why:</em> guest storage. If the disk already exists it's reused — but only counted as "has an OS" when it actually contains a filesystem (<code>virt-filesystems</code>); a leftover empty qcow2 from an aborted install is treated as fresh.</li>
+</ul>
+<ol>
+  <li><strong>Creates the domain definition.</strong> Two engines, same result:</li>
+</ol>
+<ul>
+  <li><strong>virt-install engine (default when <code>virt-install</code> is installed):</strong> the script extracts the installer kernel/initrd from the ISO (<code>/boot/x86_64/loader/{linux,initrd}</code>) into <code>/var/lib/libvirt/boot/&lt;vm&gt;-installer-{kernel,initrd}</code>, then runs <code>virt-install --name … --memory … --vcpus … --disk … --cpu host-passthrough --network network=default,model=virtio --graphics vnc,listen=… --video virtio --boot cdrom,hd --machine q35 --location &lt;ISO&gt; --extra-args console=ttyS0,115200 --print-xml</code> — i.e. <strong>XML generation only, nothing is started</strong>. The script then applies a post-define SNP patch (below) and defines + starts the domain <strong>once</strong> — so the SNP configuration is in place <em>before</em> the first boot.</li>
+  <li><strong>Generated XML engine</strong> (<code>--no-virt-install</code>, or automatic fallback): the script writes the full domain XML itself.</li>
+</ul>
+<p>The SNP-critical elements and <em>why</em> each (both engines produce these):</p>
+<table>
+  <tr><th>XML element</th><th>Why it's required</th></tr>
+  <tr><td><code>&lt;launchSecurity type='sev-snp'&gt;</code> + <code>&lt;policy&gt;</code> + <code>&lt;vms&gt;</code></td><td>Tells libvirt/QEMU to launch this VM as an SEV-SNP confidential VM. The <code>policy</code> (default <code>0x30000</code>) is the launch policy; <code>vms</code> is the VMPL (0 = guest OS). <strong>This element is what makes libvirt auto-select the SNP firmware and set up the writable NVRAM.</strong></td></tr>
+  <tr><td>(no explicit <code>&lt;loader&gt;</code>)</td><td>The SNP firmware is selected by libvirt's firmware autoselection from the <code>amd-sev-snp</code> descriptor once <code>launchSecurity type='sev-snp'</code> is present. Forcing a pflash loader without a matching NVRAM template would break the VM. (The virt-install engine <em>removes</em> the regular loader it emits.)</td></tr>
+  <tr><td><code>&lt;vsock model='virtio'&gt;</code></td><td>Optional guest↔host channel (useful for agent traffic). SNP attestation itself does <strong>not</strong> need vsock — the report is generated in-guest by the PSP, not via a host daemon.</td></tr>
+  <tr><td><code>&lt;memtune&gt;&lt;hard_limit&gt;</code></td><td>Hard memory limit slightly above guest RAM (firmware + overhead).</td></tr>
+  <tr><td><code>&lt;resource&gt;&lt;partition&gt;/machine</code></td><td>Resource partitioning for the confidential guest.</td></tr>
+  <tr><td><code>&lt;pm&gt;&lt;suspend-to-mem/disk enabled='no'&gt;</code></td><td>SNP VMs cannot suspend/hibernate — the saved image would be unmeasured/unencrypted.</td></tr>
+  <tr><td>virtio video + serial console</td><td>The display path that works for the ISO installer on a confidential guest.</td></tr>
+</table>
+<ol>
+  <li><strong>Generates an SSH key</strong> (<code>ssh-keygen -t ed25519</code>) if absent.</li>
+</ol>
+<ul>
+  <li><em>Why:</em> all later steps drive the guest passwordlessly over SSH.</li>
+</ul>
+<ol>
+  <li><strong>If the disk already has an OS:</strong> injects the SSH key and disables suspend via <code>virt-customize</code> (libguestfs offline disk editing).</li>
+</ol>
+<ul>
+  <li><em>Why virt-customize:</em> it mounts the disk image without booting the VM — faster and more reliable than console editing.</li>
+  <li>On a <strong>fresh empty disk</strong> this is skipped (nothing to mount); you inject the key after the OS install instead.</li>
+</ul>
+<ol>
+  <li><strong>Defines and starts the VM</strong> with <code>virsh</code> (generated-XML engine also attaches the ISO with <code>attach-disk --config</code> first; the virt-install engine attaches it via <code>--location</code>/cdrom at XML-generation time).</li>
+</ol>
+<ul>
+  <li><em>Why <code>--config</code> on attach-disk:</em> persists the ISO into the domain definition; a live attach would fail before the domain exists at runtime.</li>
+</ul>
+<p><strong>Alternative path — converting an existing VM:</strong> If you already have a VM (disk, network, OS) you'd rather not reinstall:</p>
+<pre>sudo ./snp-attest.sh setup-vm --no-snp --guest-iso /path/to/iso   # or use any existing VM
+virsh shutdown &lt;vm&gt;
+sudo ./snp-attest.sh convert-snp --convert-vm &lt;vm&gt;</pre>
+<div class="callout info">
+  <strong>Tip:</strong> If <code>--convert-vm</code> is omitted, <code>convert-snp</code> automatically detects running/available VMs and prompts interactively.
+</div>
+<p><code>convert-snp</code> edits the domain XML in place (removes the regular loader so the SNP firmware is autoselected, adds <code>launchSecurity type='sev-snp'</code> + <code>vsock</code>, disables suspend) using an inline Python (ElementTree) XML transformer, with automatic backup and rollback. <em>Why Python:</em> bash text munging of XML is fragile; ElementTree parses it properly.</p>
+<p class="caption"><strong>Verify:</strong></p>
+<pre>virsh list                                # VM running
+virsh dumpxml snp-guest | grep -E 'launchSecurity|vsock|policy'</pre>
+<hr>
+</div>
+
+<!-- ============ STEP 5 ============ -->
+<div class="step" id="step-5--install-the-guest-os-manual">
+<h2><span class="step-badge">Step 5</span>Install the guest OS (manual)</h2>
+<p>The installer <strong>boots automatically</strong> on the first start (one-shot direct kernel boot from the ISO — see Step 4); you only drive the installer itself through the console.</p>
+<ol>
+  <li><strong>Open the console:</strong></li>
+</ol>
+<pre>   virsh console snp-guest</pre>
+<ul>
+  <li><em>Why console:</em> the installer is wired to <code>console=ttyS0</code> (serial) — the reliable channel for a confidential guest. The VNC display works too, but the serial console never depends on the guest's display stack.</li>
+</ul>
+<ol>
+  <li><strong>Install SLES 16.1</strong> from the ISO. Use the default kernel (6.1+ is required for SEV-SNP guest support).</li>
+</ol>
+<ol>
+  <li><strong>After install + reboot, get the guest IP:</strong></li>
+</ol>
+<pre>   virsh net-dhcp-leases default
+   # or inspect all VMs:
+   sudo ./snp-attest.sh show-vm-info</pre>
+<ul>
+  <li><em>Why:</em> the guest got DHCP on libvirt's default network; the script needs this IP for SSH.</li>
+</ul>
+<div class="callout info">
+  <strong>Tip — Guest IP auto-detection:</strong> When only one VM is running, subsequent commands (<code>setup-guest</code>, <code>attest</code>, <code>register-rv</code>, <code>secret-get</code>) will auto-detect the guest IP if <code>--guest-ip</code> is omitted.
+</div>
+<ol>
+  <li><strong>If you skipped key injection (fresh disk), inject it now:</strong></li>
+</ol>
+<pre>   sudo virt-customize -a /var/lib/libvirt/images/snp-guest.qcow2 \
+       --ssh-inject root:file:$HOME/.ssh/id_ed25519.pub</pre>
+<p>(VM must be stopped for this; or paste the key via console.)</p>
+<p class="caption"><strong>Verify:</strong></p>
+<pre>ssh -i ~/.ssh/id_ed25519 root@&lt;GUEST_IP&gt; echo ok</pre>
+<hr>
+</div>
+
+<!-- ============ STEP 6 ============ -->
+<div class="step" id="step-6--set-up-the-guest-inside-the-snp-vm">
+<h2><span class="step-badge">Step 6</span>Set up the guest (inside the SNP VM)</h2>
+<p class="caption"><strong>Command (run on the HOST, acts inside the guest via SSH):</strong></p>
+<pre>sudo ./snp-attest.sh setup-guest --guest-ip &lt;GUEST_IP&gt;</pre>
+<p class="caption"><strong>What it does, in order — with the guest/host distinction explicit:</strong></p>
+<ol>
+  <li><strong>Tests SSH connectivity</strong> to the guest.</li>
+</ol>
+<ul>
+  <li><em>Why:</em> fail early with a troubleshooting checklist (sshd running? key present? right IP? firewall?) instead of dying mid-setup.</li>
+</ul>
+<ol>
+  <li><strong>Refuses to run if the target is the host.</strong></li>
+</ol>
+<ul>
+  <li><em>Why:</em> pointing this at the host would fail later with a misleading "Failed to get the report" error.</li>
+</ul>
+<ol>
+  <li><strong>Confirms the SNP guest device exists</strong> (<code>/dev/sev-guest</code>).</li>
+</ol>
+<ul>
+  <li><em>Why:</em> this character device is <strong>the proof you're inside a real SEV-SNP confidential VM</strong>. It is created by the kernel's <code>sev-guest</code> driver only when the VM was launched as an SNP guest.</li>
+</ul>
+<ol>
+  <li><strong>Disables suspend/hibernate in the guest</strong> (masks sleep targets, ignores hardware keys).</li>
+</ol>
+<ul>
+  <li><em>Why:</em> SNP cannot hibernate — the disk image would be unmeasured and unencrypted, breaking the attestation guarantee.</li>
+</ul>
+<ol>
+  <li><strong>Installs attestation packages in the guest</strong> (<code>snpguest</code>, <code>trustee</code> package) over SSH.</li>
+</ol>
+<ul>
+  <li><em>Why:</em> <code>snpguest</code> talks to <code>/dev/sev-guest</code> to generate reports; the <code>trustee</code> package's <code>kbs-client</code> is the in-guest attester for secret delivery.</li>
+</ul>
+<ol>
+  <li><strong>Verifies the packaged <code>kbs-client</code> has the SNP attester</strong> (and removes any stale source-built <code>/usr/local/bin/kbs-client-snp</code>).</li>
+</ol>
+<ul>
+  <li><em>Why:</em> the SLE <code>trustee</code> package ships an SNP-attester-capable kbs-client at <code>/usr/libexec/trustee/kbs-client</code>, version-aligned with the host verifier stack. Older builds lacked the SNP attester, and source builds from upstream master can drift ahead of the packaged verifier. If the package client lacks the attester, the script dies with an upgrade hint instead of falling back to a source build.</li>
+</ul>
+<ol>
+  <li><strong>Builds <code>snp-report-gen</code> in the guest</strong> (from <code>tools/snp-report-gen.c</code>, installing <code>gcc</code> if needed).</li>
+</ol>
+<ul>
+  <li><em>Why:</em> the distro's <code>snpguest report</code> always mints reports with a <em>random</em> <code>report_data</code> (it never reads argv). Host-mode <code>secret-get</code> needs a report whose <code>report_data</code> is bound to a TEE public key, so the script builds a minimal <code>/dev/sev-guest</code> ioctl wrapper that takes the <code>report_data</code> as an argument. Installed at <code>/usr/local/bin/snp-report-gen</code>.</li>
+</ul>
+<ol>
+  <li><strong>Generates the first report:</strong></li>
+</ol>
+<pre>   snpguest report   (in guest workdir /root/snp-attest)</pre>
+<ul>
+  <li><em>Why:</em> this is the in-guest report generator. It asks the CPU's PSP for a 4000-byte attestation report (signed with the VCEK) and writes <code>report.dat</code>. Success here proves the entire report path works: guest → GHCB → PSP → signed report.</li>
+  <li>The script then <strong>verifies</strong> the report in-guest with <code>snpguest verify</code> (ARK → ASK → VCEK chain, signature, TCB, VMPL, <code>report_data</code> binding) so you see a green local check before the remote appraisal.</li>
+</ul>
+<p class="caption"><strong>Verify (inside guest):</strong></p>
+<pre>ls -la /root/snp-attest/report.dat</pre>
+<hr>
+</div>
+
+<!-- ============ STEP 7 ============ -->
+<div class="step" id="step-7--perform-remote-attestation">
+<h2><span class="step-badge">Step 7</span>Perform remote attestation</h2>
+<p>This is the end-to-end live attestation: once your SNP guest is running, <code>attest</code> generates a 4000-byte report (signed in-guest by the CPU's PSP), submits it to CoCo-AS, which fetches the ARK/ASK/VCEK chain from AMD KDS and verifies the signature, TCB status, and launch identity, then returns an EAR token — <code>affirming</code> when the platform is valid and reference values are enrolled.</p>
+<p class="caption"><strong>Command (on the host):</strong></p>
+<pre>sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv</pre>
+<div class="callout info">
+  <strong>Default:</strong> <code>--register-rv</code> is recommended — it enrolls the guest's launch identity in RVPS <em>and</em> re-evaluates the same report, giving a clean <code>ear.status = affirming</code> in one step. See <a href="#enrolling-reference-values-into-rvps">below</a> for details.
+</div>
+<p class="caption"><strong>What it does, in order:</strong></p>
+<ol>
+  <li><strong>Generates a fresh report</strong> in the guest (<code>snpguest report</code> via SSH).</li>
+</ol>
+<ul>
+  <li><em>Why fresh:</em> the report's <code>report_data</code> is a per-run nonce; a reused report is rejected.</li>
+</ul>
+<ol>
+  <li><strong>Fetches the report</strong> (the raw 4000 bytes, base64-encoded over SSH).</li>
+</ol>
+<ul>
+  <li><em>Why base64:</em> it's binary data that must travel inside a JSON request.</li>
+  <li><em>Why raw (no JSON wrapper):</em> the CoCo-AS SNP verifier expects the raw report as the <code>evidence</code> bytes — unlike TDX, which wraps the quote in a JSON object.</li>
+</ul>
+<ol>
+  <li><strong>Enrolls reference values in RVPS</strong> (with <code>--register-rv</code>):</li>
+</ol>
+<ul>
+  <li><em>Why:</em> RVPS stores the expected launch identity (<code>id_block</code>, <code>id_auth</code>, <code>launch_digest</code>) that CoCo-AS compares against during appraisal. Without enrollment, the appraisal returns <code>contraindicated</code> because no reference values exist. <code>--register-rv</code> writes the current guest's identity into RVPS and re-evaluates the <em>same</em> report (not a fresh one), so the values match by construction → <code>ear.status = affirming</code>.</li>
+</ul>
+<ol>
+  <li><strong>Submits it to CoCo-AS</strong> with:</li>
+</ol>
+<pre>   grpcurl -plaintext -import-path "$PROTO_DIR" -proto attestation.proto -d @ 127.0.0.1:3000 \
+       attestation.AttestationService/AttestationEvaluate &lt; req.json</pre>
+<p>The request body is:</p>
+<pre>   {
+     "verification_requests": [
+       { "tee": "snp", "evidence": "&lt;base64 of the 4000-byte report&gt;" }
+     ],
+     "policy_ids": ["default"]
+   }</pre>
+<ul>
+  <li><em>Why grpcurl:</em> CoCo-AS speaks gRPC; grpcurl is the standard CLI for calling gRPC services without writing code. <code>$PROTO_DIR</code> is resolved at runtime — an existing <code>attestation.proto</code> (repo <code>protos/</code>, <code>/etc/trustee</code>, …) is used if present, otherwise the script writes one to <code>/tmp/trustee-protos/</code>. <code>snp-attest.sh</code> automatically installs prebuilt <code>grpcurl</code> into <code>/usr/local/bin</code> (or <code>~/.local/bin</code>) if missing.</li>
+  <li><em>What CoCo-AS does with it:</em> verifies the VCEK signature, fetches the ARK/ASK/VCEK chain from AMD KDS (or the local offline store), checks the reported TCB, compares the launch identity (<code>id_block</code>, <code>id_auth</code>, <code>launch_digest</code>) against RVPS reference values, then returns an <strong>EAR token</strong> — a JWT containing all measured claims plus an <code>allow: true/false</code> decision.</li>
+</ul>
+<ol>
+  <li><strong>Decodes the EAR JWT and checks <code>allow: true</code>.</strong></li>
+</ol>
+<ul>
+  <li><em>Why look in the JWT:</em> the policy decision lives <em>inside the token</em>, not in the gRPC response body. <code>allow: true</code> = attestation succeeded.</li>
+</ul>
+<p><strong>The EAR token in one sentence:</strong> CoCo-AS wraps the verified report in an <strong>EAR token</strong> — a JWT (built on EAT, RFC 9711) carrying the measured claims plus the <code>allow</code> decision; KBS verifies its signature and reads <code>allow</code> without re-doing the attestation. <em>(Full background: "Appendix — JWT &amp; EAR tokens" at the end of this guide.)</em></p>
+<p>The <code>attest</code> command decodes the EAR token (a JWT built on EAT, RFC 9711): extracts the payload, formats the claims, displays a structured verification report, and checks <code>ear.status</code> as well as the KDS <code>tcb_status</code>.</p>
+<p class="caption"><strong>Expected output (report verified, awaiting RVPS enrollment):</strong></p>
+<pre>=============================================================================
+                       SEV-SNP REMOTE ATTESTATION REPORT
+=============================================================================
+  Hardware Verification (AMD KDS):
+    TCB Status:             UpToDate
+    TEE Type:               snp
+    VMPL:                   0
+  Guest Launch Identity:
+    id_block:               &lt;32-byte family ID&gt;
+    id_auth:                &lt;32-byte author ID&gt;
+    launch_digest:          &lt;48-byte (384-bit) launch measurement&gt;
+  Trustee Appraisal Result (RVPS):
+    EAR Status:             contraindicated
+=============================================================================
+[INFO] === HARDWARE ATTESTATION SUCCESS: report verified (TCB: UpToDate) ===
+[WARN] Appraisal status is 'contraindicated' because reference values are not enrolled in RVPS.
+[WARN] To register current guest identity in RVPS and achieve 'affirming' status, run:
+  ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv
+  or: ./snp-attest.sh register-rv --guest-ip &lt;GUEST_IP&gt;</pre>
+<p class="caption"><strong>Expected output (Fully appraised with RVPS reference values):</strong></p>
+<pre>=== ATTESTATION SUCCESS: ear.status = affirming ===
+AMD KDS hardware verification AND Trustee appraisal passed!</pre>
+<h3 id="enrolling-reference-values-into-rvps">Enrolling reference values into RVPS</h3>
+<p>The default Trustee appraisal policy used by this script requires <code>id_block</code>, <code>id_auth</code>, and <code>launch_digest</code> to match approved reference values stored in the Reference Value Provider Service (RVPS). You can enroll the guest's identity directly:</p>
+<pre># Enroll reference values and attest in one step:
+sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv
+
+# Or enroll separately:
+sudo ./snp-attest.sh register-rv --guest-ip &lt;GUEST_IP&gt;
+sudo ./snp-attest.sh query-rv --id launch_digest</pre>
+<h3 id="the-snp-launch-identity-no-rtmrs">The SNP launch identity (no RTMRs)</h3>
+<p>Unlike TDX (which has four extend-only RTMR registers), an SEV-SNP guest has a <strong>single launch digest</strong> plus two identity fields, all in the 4000-byte report:</p>
+<table>
+  <tr><th>Field</th><th>Size</th><th>Measures</th><th>Stability</th></tr>
+  <tr><td><strong><code>launch_digest</code></strong></td><td>48 bytes (384-bit)</td><td>The guest's launch state: OVMF, kernel, initrd, VMSA. This is the SNP equivalent of TDX's MRTD + RTMRs rolled into one extend-only measurement.</td><td>Static per firmware + kernel + boot config</td></tr>
+  <tr><td><strong><code>id_block</code></strong></td><td>32 bytes</td><td>Guest family identifier (set by the VMM at launch).</td><td>Stable per deployment</td></tr>
+  <tr><td><strong><code>id_auth</code></strong></td><td>32 bytes</td><td>Guest author identifier (set by the VMM at launch).</td><td>Stable per deployment</td></tr>
+</table>
+<p>The report also carries <code>reported_tcb</code> (the firmware/TEE/microcode TCB the guest was launched with — checked against KDS), <code>policy</code> (the launch policy, default <code>0x30000</code>), <code>vmpl</code> (the privilege level, 0 for the guest OS), and <code>report_data</code> (a 64-byte field the caller can bind to a nonce or a TEE key).</p>
+<p><strong>Why one digest instead of four RTMRs:</strong> SEV-SNP's measurement model extends a single running digest as the firmware walks the boot chain, rather than exposing per-stage registers. The result is simpler to reason about (one value to enroll) but you lose the per-stage granularity TDX's RTMRs give you.</p>
+<h3 id="understanding-earstatus">Understanding <code>ear.status</code></h3>
+<ul>
+  <li><strong><code>affirming</code></strong> — the report verified against KDS <em>and</em> the launch identity matches enrolled RVPS reference values. This is the success state.</li>
+  <li><strong><code>contraindicated</code></strong> — hardware verification passed but no (or mismatched) RVPS reference values exist. Fix: <code>attest --register-rv</code> (or <code>register-rv</code>).</li>
+  <li><strong><code>warning</code></strong> — hardware verified, but a non-critical claim is off (e.g. TCB is <code>OutOfDate</code> — update microcode/BIOS, or the KDS cache is stale).</li>
+</ul>
+<p class="caption"><strong>If it fails:</strong></p>
+<pre>journalctl -u grpc-as.service -n 50     # CoCo-AS logs: why it rejected</pre>
+<p>Common causes: RVPS reference values don't match the guest's launch identity, reported TCB outdated, AMD KDS / offline store unreachable.</p>
+<hr>
+</div>
+
+<!-- ============ STEP 8 ============ -->
+<div class="step" id="step-8--secret-delivery">
+<h2><span class="step-badge">Step 8</span>Secret delivery</h2>
+<p>This demonstrates the full purpose of attestation: <strong>a secret is released only to a guest that has proven it is a genuine SEV-SNP confidential VM.</strong></p>
+<h3 id="8a-store-a-secret-host-admin-role">8a. Store a secret (host, admin role)</h3>
+<pre>echo "s3cr3t-api-key" &gt; /tmp/my-secret
+sudo ./snp-attest.sh secret-set --file /tmp/my-secret --path default/test/secret</pre>
+<ul>
+  <li><em>Tool:</em> <code>kbs-client config set-resource</code> in admin mode.</li>
+  <li><em>Why:</em> the secret now lives in KBS. KBS will not hand it to anyone until a client (1) attests successfully and (2) passes the resource policy.</li>
+</ul>
+<h3 id="8b-fetch-the-secret--two-methods">8b. Fetch the secret — two methods</h3>
+<p><strong>Method A (default): in-guest kbs-client</strong></p>
+<pre>sudo ./snp-attest.sh secret-get --guest-ip &lt;GUEST_IP&gt; --path default/test/secret</pre>
+<ul>
+  <li><em>What happens:</em> the script runs the SNP-enabled <code>kbs-client</code> <strong>inside the SNP VM</strong>. The client generates a real report, sends it to KBS, KBS forwards it to CoCo-AS, gets the EAR token, checks the policy, and streams the secret back.</li>
+  <li><em>Why this is the "real" method:</em> the client fetching the secret <em>is</em> the attested entity. The secret lands in the confidential VM.</li>
+</ul>
+<p><strong>Method B: host-side RCAR with a host TEE key</strong></p>
+<pre>sudo ./snp-attest.sh secret-get --guest-ip &lt;GUEST_IP&gt; --path default/test/secret --mode host</pre>
+<ul>
+  <li><em>What happens:</em> the host generates an EC P-256 TEE key, has the guest mint a report bound to it (<code>report_data = sha384</code> of the canonical runtime data, zero-padded to 64 bytes, via <code>snp-report-gen</code>), submits it to CoCo-AS with grpcurl (structured runtime data carries the <code>tee-pubkey</code> claim KBS requires), then GETs the resource from KBS and decrypts the JWE-encrypted response (ECDH-ES+A256KW/A256GCM) locally with python3 (<code>cryptography</code> + <code>jwcrypto</code>).</li>
+  <li><em>Why it exists:</em> no in-guest kbs-client needed.</li>
+  <li><em>Caveat:</em> the EAR token and the TEE private key sit on the host, so anyone with them can fetch the secret. Fine for labs; not for real secret gating.</li>
+</ul>
+<p class="caption"><strong>Expected output (both):</strong></p>
+<pre>=== SECRET DELIVERY SUCCESS: attestation passed, secret released ===</pre>
+<div class="callout info">
+  <strong>Tip — saving secrets to file:</strong> By default, <code>secret-get</code> prints text secrets to stdout. For binary secrets (or direct persistence), pass <code>--file &lt;DEST_PATH&gt;</code>. In Method A this saves the secret directly to the file inside the guest; in Method B it saves it to the host filesystem.
+</div>
+<hr>
+</div>
+
+<!-- ============ STEP 9 ============ -->
+<div class="step" id="step-9--verify-everything-is-consistent-any-time">
+<h2><span class="step-badge">Step 9</span>Verify everything is consistent (any time)</h2>
+<p class="caption"><strong>Command:</strong></p>
+<pre>sudo ./snp-attest.sh verify</pre>
+<p>Read-only deep audit. <em>Why it exists:</em> the setup steps write many config files and start many services; a single wrong endpoint or typo in the JSON fails attestation silently. <code>verify</code> cross-checks:</p>
+<ul>
+  <li>all config files exist and are valid JSON (<code>jq</code>/<code>python3</code>),</li>
+  <li><strong>CoCo-AS uses the <code>snp_verifier</code></strong> (not the TDX verifier),</li>
+  <li>KBS points at the configured CoCo-AS address,</li>
+  <li>JWKS file and KBS admin key are wired,</li>
+  <li>the resource policy file is present,</li>
+  <li>all 3 stack services active (<code>grpc-as</code>, <code>kbs</code>, <code>rvps</code>; <code>trustee.service</code> is intentionally disabled), both ports listening (<code>3000</code>, <code>8080</code>),</li>
+  <li>grpc-as libraries resolve (<code>ldd</code>),</li>
+  <li><code>/dev/sev</code> present and the SNP OVMF firmware descriptor exists,</li>
+  <li>the VM has <code>launchSecurity type='sev-snp'</code> + policy,</li>
+  <li>collateral source reachable (KDS or offline store),</li>
+  <li>guest <code>kbs-client</code> has the SNP attester feature compiled in (when reachable via SSH).</li>
+</ul>
+<p>Run it after any manual change, and whenever attestation stops working.</p>
+<hr>
+</div>
+
+<!-- ============ STEP 10 ============ -->
+<div class="step" id="step-10--cleanup-when-done">
+<h2><span class="step-badge">Step 10</span>Cleanup (when done)</h2>
+<p class="caption"><strong>Command:</strong></p>
+<pre>sudo ./snp-attest.sh clean</pre>
+<ul>
+  <li>Stops Trustee services, destroys and undefines the VM.</li>
+  <li>Pass <code>-f</code> / <code>--force</code> to skip the interactive confirmation prompt.</li>
+  <li><em>Deliberately keeps:</em> configs, keys, policies, the certificate store, and the disk image (all listed in the output) — so re-running setup is incremental, not from scratch.</li>
+  <li>Remove the disk manually if truly done: <code>rm /var/lib/libvirt/images/snp-guest.qcow2</code></li>
+</ul>
+<hr>
+</div>
+
+<!-- ============ STEP 11 ============ -->
+<div class="step" id="step-11--air-gapped--offline-setup-optional">
+<h2><span class="step-badge">Step 11</span>Air-gapped / Offline Setup (optional)</h2>
+<p>If your host <strong>cannot reach AMD KDS</strong> (no internet, air-gapped network, compliance requirements), you must use a <strong>local offline certificate store</strong> that holds the ARK → ASK → VCEK chain. The scripts support this via the <code>--collateral offline</code> flag.</p>
+<h3 id="what-is-the-offline-store">What is the offline store?</h3>
+<p>The offline store is a local directory of PEM certificates:</p>
+<ul>
+  <li><strong>ARK</strong> — AMD Root Key certificate (the trust anchor)</li>
+  <li><strong>ASK</strong> — AMD Signing Key certificate (signed by the ARK)</li>
+  <li><strong>VCEK</strong> — the VM Certificate Key certificate for your guest (signed by the ASK), fetched for the specific launch identity</li>
+</ul>
+<p>Without the offline store, the SNP stack fetches collateral from AMD KDS at runtime (<code>https://kdsintf.amd.com/vcek/v1/SEV_SNP</code>). With the offline store, it reads from <code>/var/lib/sev-snp/certs/</code> instead.</p>
+<div class="callout info">
+  <strong>SEV-SNP vs TDX offline:</strong> TDX needs a full <strong>PCCS</strong> server (Node.js + SQLite) to cache PCK/TCB/QE collateral, plus a one-time <strong>platform registration</strong> while online. SEV-SNP needs <strong>neither</strong> — just the three PEM files. There is no per-platform registration to do while online, which makes the air-gapped transition much simpler.
+</div>
+<h3 id="prerequisites-for-air-gapped-operation">Prerequisites for air-gapped operation</h3>
+<table>
+  <tr><th>Requirement</th><th>Notes</th></tr>
+  <tr><td>ARK/ASK/VCEK PEM files</td><td>Must be obtained <em>before</em> going offline (see below)</td></tr>
+  <tr><td>SLES 16.1 ISO</td><td>Same as online setup</td></tr>
+  <tr><td>SEV-SNP enabled in BIOS</td><td>Same as online setup</td></tr>
+  <tr><td><code>kvm_amd</code> with SNP support</td><td>Same as online setup</td></tr>
+</table>
+<h3 id="step-by-step-initial-sync-while-you-still-have-internet">Step-by-step: initial sync (while you still have internet)</h3>
+<h4>1. Fetch the certificate chain</h4>
+<p>The simplest path: run the normal online setup once, which populates the local store from KDS:</p>
+<pre>sudo ./snp-attest.sh setup-host          # default --collateral kds
+ls -la /var/lib/sev-snp/certs/           # ark.pem, ask.pem, vcek.pem</pre>
+<p>Alternatively, import a chain you obtained from a trusted source with <code>snphost import</code> (see the <code>snphost</code> man page for the exact import syntax for your build).</p>
+<h4>2. Verify the store is complete</h4>
+<pre>sudo ./snp-attest.sh check --collateral offline</pre>
+<p>This confirms the offline store is populated and usable.</p>
+<h3 id="step-by-step-going-offline">Step-by-step: going offline</h3>
+<h4>3. Disconnect the host from the internet</h4>
+<h4>4. Run the full setup with <code>--collateral offline</code></h4>
+<pre>sudo ./snp-attest.sh check --collateral offline
+sudo ./snp-attest.sh setup-host --collateral offline
+sudo ./snp-attest.sh setup-trustee --collateral offline
+sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso --collateral offline</pre>
+<div class="callout info">
+  <span class="tag">Note</span>
+  the <code>--collateral offline</code> flag tells <code>setup-host</code> to use the local store (not fetch from KDS) and <code>setup-trustee</code> to configure CoCo-AS to read the local store. <code>setup-vm</code> doesn't directly use the flag but benefits from the host being configured.
+</div>
+<h4>5. Complete the remaining steps (5–10) as usual</h4>
+<p>Steps 5–10 (guest OS install, guest setup, attestation, secret delivery, verify, cleanup) are <strong>identical</strong> to the online flow. The only difference is that report verification reads the ARK/ASK/VCEK chain from the local store instead of AMD KDS.</p>
+<h3 id="offline-store-maintenance">Offline store maintenance</h3>
+<p>The ARK and ASK certificates are long-lived (they are AMD's root of trust and rarely change). The <strong>VCEK</strong> is per-launch-identity and is stable for a given guest configuration. If you change the guest's launch identity (different OVMF/kernel → different <code>launch_digest</code>), you need a fresh VCEK — fetch it while online, or re-run <code>setup-host</code> with internet access.</p>
+<p>If the ARK/ASK are ever rotated by AMD, re-fetch the chain while online and re-run <code>setup-host --collateral kds</code> to refresh the store.</p>
+<hr>
+</div>
+
+<h2 id="appendix--jwt--ear-tokens">Appendix — JWT &amp; EAR tokens</h2>
+<p><strong>What is a JWT?</strong> A <strong>JWT (JSON Web Token)</strong> is a standard format (RFC 7519) for carrying signed data as a single string. It has three base64url-encoded parts separated by dots:</p>
+<pre>header.payload.signature</pre>
+<ul>
+  <li><strong>header</strong> — signing algorithm and key type</li>
+  <li><strong>payload</strong> — the actual claims (JSON data)</li>
+  <li><strong>signature</strong> — cryptographic proof the content wasn't tampered with</li>
+</ul>
+<p>In this flow, the <strong>EAR token</strong> from CoCo-AS is a JWT whose payload contains:</p>
+<ul>
+  <li>the measured claims (<code>id_block</code>, <code>id_auth</code>, <code>launch_digest</code>, TCB, policy, vmpl)</li>
+  <li><code>allow: true/false</code> — the policy decision</li>
+  <li>the issuer and expiry</li>
+</ul>
+<p><strong>What is EAR?</strong> EAR = <strong>EAT Attestation Result</strong>. It's a standard JWT format built on the IETF Entity Attestation Token (EAT, RFC 9711), as used by the Confidential Containers / Trustee ecosystem.</p>
+<p>The raw SNP report is complex (binary, AMD-specific). The EAR token:</p>
+<ol>
+  <li><strong>Normalizes</strong> it into standard JSON</li>
+  <li><strong>Adds the policy decision</strong> (<code>allow</code>)</li>
+  <li><strong>Makes it portable</strong> — KBS doesn't need to understand SEV-SNP, just verify the JWT signature and read <code>allow</code></li>
+</ol>
+<p>The EAR token is the <strong>bridge</strong> between hardware-specific attestation and generic secret delivery.</p>
+<p><strong>Why it's used:</strong> KBS receives the token, verifies its signature with the JWKS (the public key set from Step 3), and trusts the claims <em>without</em> re-doing the whole attestation. The token is portable proof that "this guest was verified" — that's why the script can use it as a bearer token in Step 8.</p>
+<hr>
+<h2 id="troubleshooting-map">Troubleshooting map</h2>
+<table>
+  <tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr>
+  <tr><td>QEMU/libvirt fail at launch: "SEV-SNP not supported"</td><td><code>kvm_amd</code> not loaded with SNP, or BIOS SEV-SNP off</td><td>Check <code>dmesg | grep -i sev</code>; enable SEV-SNP in BIOS, reload <code>kvm_amd</code>. Verify: <code>ls -la /dev/sev</code></td></tr>
+  <tr><td><code>check</code>: "CPU does NOT report SEV-SNP support"</td><td>BIOS SEV-SNP disabled, or CPU predates SEV-SNP</td><td>Enable SEV-SNP in BIOS (AMD EPYC Rome/Genoa/Turin+). No registration needed (unlike TDX)</td></tr>
+  <tr><td><code>/dev/sev</code> missing</td><td><code>kvm_amd</code> not loaded with SNP support</td><td><code>modprobe kvm_amd</code>; check <code>dmesg | grep -i sev</code> for SEV-SNP init</td></tr>
+  <tr><td><code>modprobe sev-guest</code> → "No such device" inside guest</td><td>VM not launched as an SNP guest</td><td><code>sudo ./snp-attest.sh verify</code> → VM rows; check <code>launchSecurity type='sev-snp'</code> in <code>virsh dumpxml</code></td></tr>
+  <tr><td>Installer never appears; guest boots but isn't confidential</td><td><code>launchSecurity</code> missing or firmware not SNP</td><td><code>virsh dumpxml</code> — confirm <code>launchSecurity type='sev-snp'</code> + <code>&lt;policy&gt;</code>; confirm the SNP OVMF descriptor exists</td></tr>
+  <tr><td><code>snpguest report</code>: "Failed to get the report"</td><td><code>/dev/sev-guest</code> not present or GHCB not set up</td><td>Confirm the VM is a real SNP guest (Step 6 item 3); check the guest kernel has the <code>sev-guest</code> driver</td></tr>
+  <tr><td>Attestation: <code>ear.status: contraindicated</code></td><td>RVPS values missing or mismatched</td><td>Run <code>sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv</code> or check <code>journalctl -u grpc-as.service -n 50</code></td></tr>
+  <tr><td>Attestation: <code>ear.status: warning</code> (TCB OutOfDate)</td><td>Reported TCB older than KDS's current TCB</td><td>Update guest microcode/BIOS, or refresh the KDS cache / offline store</td></tr>
+  <tr><td>CoCo-AS: "unknown TEE" / verifier error</td><td>CoCo-AS not using <code>snp_verifier</code></td><td><code>sudo ./snp-attest.sh setup-trustee</code> (rewrites <code>grpc-as.json</code> with <code>snp_verifier</code>); or <code>verify</code> → CoCo-AS rows</td></tr>
+  <tr><td>KBS rejects tokens: <code>neither trusted jwk set nor trusted pem public key works</code></td><td>Token header embeds a <code>jwk</code> but the <code>x5c</code> chain is empty or doesn't chain to <code>trusted_certs_paths</code></td><td><code>sudo ./snp-attest.sh setup-trustee</code> (regenerates <code>/etc/trustee/as-signer.crt</code>, <code>grpc-as.json</code> <code>cert_path</code>, <code>kbs.json</code> <code>trusted_certs_paths</code>); or <code>verify</code> → JWKS rows</td></tr>
+  <tr><td><code>trustee.service</code> reports <code>inactive</code> / condition failed</td><td>The monolithic <code>trustee.service</code> is intentionally disabled in favor of individual modular units</td><td>Expected behavior. Verify the active modular services: <code>systemctl is-active grpc-as kbs rvps</code></td></tr>
+  <tr><td>Guest kbs-client missing or lacks SNP attester</td><td><code>trustee</code> package too old</td><td>Install/upgrade the <code>trustee</code> package from the Virtualization:SGX repo, then re-run <code>sudo ./snp-attest.sh setup-guest --guest-ip &lt;GUEST_IP&gt;</code></td></tr>
+  <tr><td>Guest can't reach KBS (secret-get times out)</td><td>Host firewall blocks 8080, wrong guest IP, or libvirt NAT issue</td><td>From the guest: <code>curl -sI http://&lt;HOST_IP&gt;:8080</code> — check the host firewall (<code>sudo firewall-cmd --list-ports</code>) and re-fetch the IP with <code>virsh net-dhcp-leases default</code></td></tr>
+  <tr><td>Offline mode: verification fails with a cert error</td><td>ARK/ASK/VCEK store incomplete or stale</td><td><code>sudo ./snp-attest.sh check --collateral offline</code>; re-run <code>setup-host --collateral kds</code> while online to refresh</td></tr>
+  <tr><td><code>grpcurl: command not found</code></td><td>Auto-installed grpcurl not in PATH</td><td>The script installs it to <code>/usr/local/bin</code> (root) or <code>~/.local/bin</code> — check <code>echo $PATH</code>, or re-run <code>attest</code> as root so it lands in <code>/usr/local/bin</code></td></tr>
+</table>
+<p>Debug any step with full command trace:</p>
+<pre>sudo ./snp-attest.sh &lt;command&gt; -d</pre>
+<div class="callout info">
+  <span class="tag">Note</span>
+  options always come <strong>after</strong> the command — <code>snp-attest.sh -d check</code> is rejected with <code>Unknown option: check</code>.
+</div>
+<hr>
+<h2 id="acronym-glossary">Acronym Glossary</h2>
+<h3 id="tee-platforms--architectures">TEE Platforms &amp; Architectures</h3>
+<table>
+  <tr><th>Acronym</th><th>Full Name</th><th>Description</th></tr>
+  <tr><td>SEV</td><td>Secure Encrypted Virtualization</td><td>AMD's confidential computing technology; encrypts guest memory</td></tr>
+  <tr><td>SEV-ES</td><td>SEV Encrypted State</td><td>SEV extension that also encrypts the CPU register state</td></tr>
+  <tr><td>SEV-SNP</td><td>SEV Secure Nested Paging</td><td>SEV extension adding memory integrity + launch measurement + attestation</td></tr>
+  <tr><td>TDX</td><td>Trust Domain Extensions</td><td>Intel's equivalent confidential-VM technology (for comparison)</td></tr>
+</table>
+<h3 id="amd-specific">AMD-Specific</h3>
+<table>
+  <tr><th>Acronym</th><th>Full Name</th><th>Description</th></tr>
+  <tr><td>PSP</td><td>Platform Security Processor</td><td>AMD's on-die security coprocessor; generates and signs the SNP attestation report with the VCEK</td></tr>
+  <tr><td>GHCB</td><td>Guest-Hypervisor Communication Block</td><td>Shared memory page the guest uses to talk to the PSP (e.g. <code>GET_REPORT</code>)</td></tr>
+  <tr><td>VCEK</td><td>VM Certificate Key</td><td>Per-launch-identity key the PSP uses to sign reports; chained to the ASK</td></tr>
+  <tr><td>VLEK</td><td>VM Launch Encryption Key</td><td>Key used to encrypt the guest's launch secret (for direct launch)</td></tr>
+  <tr><td>ARK</td><td>AMD Root Key</td><td>AMD's root-of-trust certificate (top of the chain)</td></tr>
+  <tr><td>ASK</td><td>AMD Signing Key</td><td>AMD's signing key, signed by the ARK; signs VCEKs</td></tr>
+  <tr><td>KDS</td><td>Key Distribution Service</td><td>AMD's service that serves the ARK/ASK/VCEK chain and TCB info</td></tr>
+  <tr><td>launch_digest</td><td>Launch Digest</td><td>384-bit measurement of the guest launch (OVMF, kernel, initrd, VMSA) — the SNP equivalent of TDX's MRTD + RTMRs</td></tr>
+  <tr><td>id_block</td><td>Identity Block</td><td>32-byte guest family identifier set by the VMM at launch</td></tr>
+  <tr><td>id_auth</td><td>Identity Auth</td><td>32-byte guest author identifier set by the VMM at launch</td></tr>
+  <tr><td>VMPL</td><td>VM Privilege Level</td><td>SEV-SNP privilege level (0 = guest OS, 1–3 = more privileged)</td></tr>
+  <tr><td>VMSA</td><td>VM Save Area</td><td>The initial CPU/register state of the guest at launch</td></tr>
+  <tr><td>reported_tcb</td><td>Reported TCB</td><td>The firmware/TEE/microcode TCB the guest was launched with (checked against KDS)</td></tr>
+  <tr><td>report_data</td><td>Report Data</td><td>64-byte field in the report the caller can bind to a nonce or a TEE key</td></tr>
+  <tr><td>policy</td><td>Launch Policy</td><td>64-bit launch policy bits (default <code>0x30000</code>) controlling SNP launch options</td></tr>
+  <tr><td>TCB</td><td>Trusted Computing Base</td><td>Set of hardware/firmware/software critical to platform security (evaluated by KDS)</td></tr>
+  <tr><td>SVN</td><td>Security Version Number</td><td>Monotonically increasing counter reflecting security patch level</td></tr>
+</table>
+<h3 id="attestation--cryptography">Attestation &amp; Cryptography</h3>
+<table>
+  <tr><th>Acronym</th><th>Full Name</th><th>Description</th></tr>
+  <tr><td>EAR</td><td>EAT Attestation Result</td><td>JWT built on EAT (RFC 9711) used by Trustee to convey appraisal outcomes</td></tr>
+  <tr><td>EAT</td><td>Entity Attestation Token</td><td>IETF token format underlying EAR</td></tr>
+  <tr><td>RATS</td><td>Remote ATtestation procedureS</td><td>IETF architecture (RFC 9334) defining Attester / Verifier / Relying Party roles</td></tr>
+  <tr><td>KBS</td><td>Key Broker Service</td><td>Trustee component that brokers secrets after successful attestation</td></tr>
+  <tr><td>CoCo</td><td>Confidential Containers</td><td>Industry project for running containers in TEE-backed VMs</td></tr>
+  <tr><td>AS</td><td>Attestation Service</td><td>Trustee component that receives attestation requests and verifies evidence</td></tr>
+  <tr><td>RVPS</td><td>Reference Value Provider Service</td><td>Trustee component for storing and serving reference values to the policy engine</td></tr>
+  <tr><td>Rego</td><td>Rego (OPA policy language)</td><td>Policy language used by Open Policy Agent (OPA); Trustee uses it for attestation policies</td></tr>
+  <tr><td>JWT</td><td>JSON Web Token</td><td>Token format used in attestation responses</td></tr>
+  <tr><td>JWKS</td><td>JSON Web Key Set</td><td>Format for publishing public keys used to verify JWT signatures</td></tr>
+  <tr><td>JWE</td><td>JSON Web Encryption</td><td>Format for encrypted payloads (used by KBS secret delivery)</td></tr>
+  <tr><td>DER</td><td>Distinguished Encoding Rules</td><td>Binary encoding format for X.509 certificates</td></tr>
+  <tr><td>PEM</td><td>Privacy-Enhanced Mail</td><td>Base64-encoded encoding of DER certificates with header/footer</td></tr>
+  <tr><td>ECDSA</td><td>Elliptic Curve Digital Signature Algorithm</td><td>Signature algorithm used by the VCEK (P-384) and the CoCo-AS signer (P-256)</td></tr>
+  <tr><td>SHA384</td><td>Secure Hash Algorithm 384-bit</td><td>Hash function used for the launch digest and <code>report_data</code> binding</td></tr>
+  <tr><td>base64</td><td>Base64</td><td>Encoding format for binary data in JSON evidence</td></tr>
+</table>
+<h3 id="virtualization--infrastructure">Virtualization &amp; Infrastructure</h3>
+<table>
+  <tr><th>Acronym</th><th>Full Name</th><th>Description</th></tr>
+  <tr><td>QEMU</td><td>Quick Emulator</td><td>Open-source machine emulator and virtualizer</td></tr>
+  <tr><td>KVM</td><td>Kernel-based Virtual Machine</td><td>Linux kernel module providing virtualization infrastructure</td></tr>
+  <tr><td>Libvirt</td><td>libvirt</td><td>Virtualization management API and tool suite</td></tr>
+  <tr><td>OVMF</td><td>Open Virtual Machine Firmware</td><td>EDK2 UEFI firmware implementation for virtual machines</td></tr>
+  <tr><td>EDK2</td><td>EFI Development Kit 2</td><td>Open-source UEFI/BIOS implementation</td></tr>
+  <tr><td>UEFI</td><td>Unified Extensible Firmware Interface</td><td>Modern firmware interface replacing BIOS</td></tr>
+  <tr><td>RPM</td><td>RPM Package Manager</td><td>Package format used by SUSE/RHEL distributions</td></tr>
+  <tr><td>SLES</td><td>SUSE Linux Enterprise Server</td><td>The reference distribution for this guide</td></tr>
+  <tr><td>JSON</td><td>JavaScript Object Notation</td><td>Data interchange format used in attestation evidence</td></tr>
+  <tr><td>HTTP</td><td>Hypertext Transfer Protocol</td><td>Network protocol used for KBS REST and AMD KDS collateral</td></tr>
+  <tr><td>Rust</td><td>Rust</td><td>Programming language used by Trustee</td></tr>
+</table>
+<h3 id="trustee-specific">Trustee-Specific</h3>
+<table>
+  <tr><th>Acronym</th><th>Full Name</th><th>Description</th></tr>
+  <tr><td>Trustee</td><td>Trustee (CoCo project)</td><td>The confidential container attestation framework (KBS + AS)</td></tr>
+  <tr><td>CoCoAS</td><td>Confidential Containers Attestation Service</td><td>Trustee's attestation service adapter layer</td></tr>
+  <tr><td>attester</td><td>Attester</td><td>Client component that collects and submits TEE evidence</td></tr>
+  <tr><td>verifier</td><td>Verifier</td><td>Trustee component that validates TEE evidence and generates claims (<code>snp_verifier</code> for SEV-SNP)</td></tr>
+  <tr><td>tenant</td><td>Tenant</td><td>The workload owner whose VM/containers are being attested</td></tr>
+</table>
+<h3 id="general">General</h3>
+<table>
+  <tr><th>Acronym</th><th>Full Name</th><th>Description</th></tr>
+  <tr><td>VM</td><td>Virtual Machine</td><td>Isolated computing environment</td></tr>
+  <tr><td>Hypervisor</td><td>Hypervisor</td><td>Software/hardware layer managing VMs</td></tr>
+  <tr><td>ioctl</td><td>I/O Control</td><td>System call for device-specific operations (used by <code>snp-report-gen</code> on <code>/dev/sev-guest</code>)</td></tr>
+  <tr><td>API</td><td>Application Programming Interface</td><td>Interface for software components to communicate</td></tr>
+  <tr><td>CLI</td><td>Command Line Interface</td><td>User command interface</td></tr>
+  <tr><td>gRPC</td><td>gRPC (HTTP/2-based RPC)</td><td>RPC framework used by Trustee for inter-component communication</td></tr>
+  <tr><td>REST</td><td>Representational State Transfer</td><td>HTTP-based API style used by the KBS</td></tr>
+  <tr><td>DNS</td><td>Domain Name System</td><td>Network service for resolving hostnames</td></tr>
+  <tr><td>ISO</td><td>International Organization for Standardization</td><td>Standards body</td></tr>
+  <tr><td>NIST</td><td>National Institute of Standards and Technology</td><td>US agency that standardized several crypto algorithms</td></tr>
+</table>
+<hr>
+<h2 id="license">License</h2>
+<p>Copyright (C) 2026 aginies Source: <a href="https://github.com/aginies/coco_snp">https://github.com/aginies/coco_snp</a></p>
+<p>This program is free software: you can redistribute it and/or modify it under the terms of the <strong>GNU General Public License, version 3</strong> as published by the Free Software Foundation. See the <a href="LICENSE"><code>LICENSE</code></a> file for the full text.</p>
+<p><code>snp-attest.sh</code> prints the classic GPL notice when run interactively, and <code>show-w</code> / <code>show-c</code> print the warranty / copyright terms:</p>
+<pre>sudo ./snp-attest.sh show-w   # warranty terms (no warranty)
+sudo ./snp-attest.sh show-c   # copyright &amp; license terms</pre>
+
+
+<footer>Generated dynamically from README.md — Intel TDX attestation on SLES 16.1</footer>
+
+</main>
+</div>
+</body>
+</html>
