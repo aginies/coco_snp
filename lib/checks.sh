@@ -123,6 +123,29 @@ check_boot_params() {
         record "WARN" "Boot params: AMD IOMMU not detected (required for SEV-SNP)" \
             "Add 'amd_iommu=on iommu=pt' to the kernel cmdline (GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub), then reboot"
     fi
+
+    # AMD Memory Encryption (mem_encrypt) — the kernel-side SEV switch.
+    # 'on' is explicit; the default ('auto') works when the CPU supports it,
+    # and /dev/sev proves the driver came up. 'off' disables SEV entirely.
+    local mem_encrypt
+    mem_encrypt=$(grep -oE 'mem_encrypt=[a-z]+' <<<"$cmdline" | head -1 || true)
+    case "$mem_encrypt" in
+    mem_encrypt=on)
+        record "PASS" "Boot params: mem_encrypt=on in /proc/cmdline"
+        ;;
+    mem_encrypt=off)
+        record "FAIL" "Boot params: mem_encrypt=off disables SEV-SNP" \
+            "Change to 'mem_encrypt=on' in the kernel cmdline (GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub), then reboot"
+        ;;
+    *)
+        if [[ -c /dev/sev ]]; then
+            record "PASS" "Boot params: mem_encrypt not set (default auto; /dev/sev present)"
+        else
+            record "WARN" "Boot params: mem_encrypt not set and /dev/sev missing" \
+                "Add 'mem_encrypt=on' to the kernel cmdline (GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub), then reboot"
+        fi
+        ;;
+    esac
 }
 
 # libvirt is modular since SLE 16 / libvirt 5.7: the monolithic libvirtd.service
@@ -383,7 +406,7 @@ cmd_check_platform() {
 cmd_check() {
     log "=== SEV-SNP host capability check ==="
     step "Probe host for SEV-SNP readiness (read-only, no changes made)" \
-        "Checks CPU/BIOS SEV-SNP, KVM, boot params (kvm_amd sev_snp, IOMMU), libvirt, QEMU, guestfs-tools, /dev/sev, snphost, Trustee services, ports, KDS reachability."
+        "Checks CPU/BIOS SEV-SNP, KVM, boot params (kvm_amd sev_snp, mem_encrypt, IOMMU), libvirt, QEMU, guestfs-tools, /dev/sev, snphost, Trustee services, ports, KDS reachability."
     CHECK_RESULTS=()
 
     check_cpu_snp

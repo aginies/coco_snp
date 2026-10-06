@@ -185,7 +185,7 @@ cd coco_snp-1.0.0</pre>
   <tr><th>Probe</th><th>Tool</th><th>Why we check it</th></tr>
   <tr><td>CPU SEV-SNP flag</td><td><code>grep /proc/cpuinfo</code></td><td>Hardware must advertise <code>sev_snp</code>. Fallback: <code>/dev/sev</code> SNP ioctl support.</td></tr>
   <tr><td>KVM</td><td><code>stat /dev/kvm</code></td><td>No <code>/dev/kvm</code> → no VMs at all.</td></tr>
-  <tr><td>Boot params (SEV-SNP)</td><td><code>/proc/cmdline</code> + <code>/sys/module/kvm_amd/parameters/sev_snp</code></td><td>The kernel/boot side of enabling SNP: <code>kvm_amd</code> must be loaded with <code>sev_snp=1</code> (cmdline or <code>/etc/modprobe.d</code>), and the AMD IOMMU must be on (<code>amd_iommu=on</code>).</td></tr>
+  <tr><td>Boot params (SEV-SNP)</td><td><code>/proc/cmdline</code> + <code>/sys/module/kvm_amd/parameters/sev_snp</code></td><td>The kernel/boot side of enabling SNP: <code>kvm_amd</code> must be loaded with <code>sev_snp=1</code> (cmdline or <code>/etc/modprobe.d</code>), <code>mem_encrypt=on</code> must not be off (the default <code>auto</code> is accepted when <code>/dev/sev</code> exists), and the AMD IOMMU must be on (<code>amd_iommu=on</code>).</td></tr>
   <tr><td>libvirt</td><td><code>virsh -c qemu:///system version</code></td><td>A successful connection proves libvirt works (modular <code>virtqemud</code> or monolithic).</td></tr>
   <tr><td>QEMU version</td><td><code>qemu-system-x86_64 --version</code></td><td>SEV-SNP support requires QEMU ≥ 8.0.</td></tr>
   <tr><td>virt-customize</td><td><code>command -v virt-customize</code></td><td>guestfs-tools does the offline SSH-key injection in <code>setup-vm</code>. WARN only.</td></tr>
