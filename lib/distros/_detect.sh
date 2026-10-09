@@ -22,6 +22,8 @@
 #   <id>_ca_trust_refresh       -> refresh the host system trust store
 #   <id>_ca_trust_cmd           -> remote cmd (stdin=CA) to trust a CA in the guest
 #   <id>_guest_pkg_install <p...> -> install inside the guest over ssh
+#   <id>_guest_repo_add         -> register the SNP package repo in the guest
+#                                  (optional; omitted = no extra repo needed)
 #
 # Roles: snp_host, snp_guest, trustee, libvirt, qemu, virt_customize, ovmf,
 #        grpcurl
@@ -155,4 +157,16 @@ guest_distro_snp_guest_bin() {
 guest_distro_pkg_install() {
     ensure_guest_distro
     "${GUEST_DISTRO}_guest_pkg_install" "$@"
+}
+
+# Register the SNP attestation package repository inside the guest. Adapters
+# that need no extra repo can leave the hook undefined — this is a no-op then.
+guest_distro_repo_add() {
+    ensure_guest_distro
+    local hook="${GUEST_DISTRO}_guest_repo_add"
+    if declare -F "$hook" >/dev/null 2>&1; then
+        "$hook"
+    else
+        log "No guest repo hook for ${GUEST_DISTRO}; assuming the SNP packages are in the default repos."
+    fi
 }

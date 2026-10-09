@@ -299,7 +299,7 @@ sudo ./snp-attest.sh setup-host
    store (`/var/lib/sev-snp/certs/`).
    - *Why:* verification needs the root chain. In the default `kds` mode the
      chain is fetched from AMD's global KDS
-     (`https://kdsintf.amd.com/vcek/v1/SEV_SNP`). In `offline` mode the store
+     (`https://kdsintf.amd.com/vcek/v1`). In `offline` mode the store
      must already be populated (see [Step 11](#step-11--air-gapped--offline-setup-optional)).
    - *Why a local store:* CoCo-AS and `snphost` read the chain from disk at
      verification time; caching it locally also makes re-runs fast and lets an
@@ -975,7 +975,7 @@ The offline store is a local directory of PEM certificates:
   ASK), fetched for the specific launch identity
 
 Without the offline store, the SNP stack fetches collateral from AMD KDS at
-runtime (`https://kdsintf.amd.com/vcek/v1/SEV_SNP`). With the offline store,
+runtime (`https://kdsintf.amd.com/vcek/v1`). With the offline store,
 it reads from `/var/lib/sev-snp/certs/` instead.
 
 > **SEV-SNP vs TDX offline:** TDX needs a full **PCCS** server (Node.js +

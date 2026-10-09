@@ -64,10 +64,14 @@ json_valid() {
 }
 
 check_cpu_snp() {
-    # Host advertises 'sev_snp'; a guest advertises 'sev' / 'sev_snp' too.
+    # 'sev_snp' is the flag that actually matters; plain 'sev' (or 'sev_es')
+    # is a pre-SNP generation and must not be reported as SEV-SNP support.
     # As a fallback, the presence of /dev/sev proves SEV-SNP is active on the host.
-    if grep -qwE 'sev_snp|sev' /proc/cpuinfo 2>/dev/null; then
-        record "PASS" "CPU/kernel reports SEV-SNP (sev_snp/sev flag)"
+    if grep -qw 'sev_snp' /proc/cpuinfo 2>/dev/null; then
+        record "PASS" "CPU/kernel reports SEV-SNP (sev_snp flag)"
+    elif grep -qwE 'sev|sev_es' /proc/cpuinfo 2>/dev/null && [[ ! -c /dev/sev ]]; then
+        record "FAIL" "CPU reports SEV/SEV-ES but NOT SEV-SNP (no sev_snp flag)" \
+            "Needs an AMD EPYC Milan (7003) or newer with SEV-SNP enabled in BIOS; check 'dmesg | grep -i sev'"
     elif [[ -c /dev/sev ]]; then
         record "PASS" "SEV-SNP active on host (/dev/sev present)"
     else
@@ -267,15 +271,16 @@ check_host_snp() {
             "Load kvm_amd with SNP enabled; check BIOS SEV-SNP and 'dmesg | grep -i sev'"
         return
     fi
-    local sev_state
-    sev_state=$(snphost ok 2>/dev/null | head -1 || true)
-    if command -v snphost >/dev/null 2>&1 && snphost ok >/dev/null 2>&1; then
+    # Order matters: probing 'snphost ok' before checking the binary exists
+    # made the "not installed yet" branch unreachable.
+    if ! command -v snphost >/dev/null 2>&1; then
+        record "PASS" "Host SEV-SNP ready (/dev/sev present; snphost not installed yet)" \
+            "Install snphost ($(distro_pkg_manager) in $(distro_pkgs snp_host)) for the full platform probe"
+    elif snphost ok >/dev/null 2>&1; then
         record "PASS" "Host SEV-SNP ready (/dev/sev present, snphost ok)"
-    elif [[ -n "$sev_state" ]]; then
-        record "PASS" "Host SEV-SNP ready (/dev/sev present; snphost not installed yet)"
     else
-        record "WARN" "Host SEV-SNP: /dev/sev present but snphost probe not run" \
-            "Install snphost ($(distro_pkg_manager) in $(distro_pkgs snp_host)) and re-run"
+        record "WARN" "Host SEV-SNP: /dev/sev present but 'snphost ok' reported a problem" \
+            "Run 'snphost ok' and check BIOS SEV-SNP settings"
     fi
 }
 
@@ -314,7 +319,9 @@ check_snphost() {
 check_trustee() {
     local svc
     local missing=()
-    for svc in grpc-as.service kbs.service rvps.service; do
+    # rvps.service is deliberately not in this list: grpc-as runs the
+    # reference-value store in-process ("rvps_config": {"type": "BuiltIn"}).
+    for svc in grpc-as.service kbs.service; do
         if ! systemctl cat "$svc" >/dev/null 2>&1; then
             missing+=("$svc (not installed)")
         elif [[ "$(systemctl is-active "$svc" 2>/dev/null)" != "active" ]]; then
@@ -322,7 +329,7 @@ check_trustee() {
         fi
     done
     if ((${#missing[@]} == 0)); then
-        record "PASS" "Trustee stack running (grpc-as, kbs, rvps)"
+        record "PASS" "Trustee stack running (grpc-as, kbs)"
     else
         local trustee_pkg
         trustee_pkg=$(distro_pkgs trustee | awk '{print $1}')
@@ -389,7 +396,7 @@ cmd_check_platform() {
     local rc=0
     run snphost fetch ca pem "$SNP_CERT_DIR" || rc=$?
     if ((rc == 0)); then
-        run snphost fetch vcek pem "$SNP_CERT_DIR" || rc=$?
+        run snphost fetch vek pem "$SNP_CERT_DIR" 2>/dev/null || run snphost fetch vcek pem "$SNP_CERT_DIR" || rc=$?
     fi
     if ((rc != 0)); then
         trap - ERR
@@ -500,6 +507,25 @@ verify_service() {
         record "PASS" "${svc} is active"
     else
         record "FAIL" "${svc} is ${state}" "journalctl -u ${svc} -n 50"
+    fi
+}
+
+# Like verify_service, but a missing/stopped unit is only a warning. Used for
+# rvps.service: grpc-as runs the reference-value store in-process ("BuiltIn"),
+# so a standalone RVPS is not part of the attestation path.
+verify_service_optional() {
+    local svc="$1" why="$2"
+    if ! systemctl cat "$svc" >/dev/null 2>&1; then
+        record "PASS" "${svc} not installed (optional)" "$why"
+        return
+    fi
+    local state
+    state=$(systemctl is-active "$svc" 2>/dev/null || true)
+    state="${state:-inactive}"
+    if [[ "$state" == "active" ]]; then
+        record "PASS" "${svc} is active"
+    else
+        record "WARN" "${svc} is ${state} (optional)" "$why"
     fi
 }
 
@@ -633,7 +659,8 @@ cmd_verify() {
     # --- Services running ---
     verify_service grpc-as.service
     verify_service kbs.service
-    verify_service rvps.service
+    verify_service_optional rvps.service \
+        "grpc-as runs the RVPS in-process (rvps_config type BuiltIn)"
 
     # --- Ports listening ---
     verify_port "CoCo-AS" "${COCO_AS##*:}" "Start grpc-as.service (setup-trustee)"

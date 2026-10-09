@@ -20,3 +20,4 @@ fedora_ovmf_regular_probe() { die "Fedora/RHEL adapter is not implemented yet (l
 fedora_grub_snp_hint() { die "Fedora/RHEL adapter is not implemented yet (libsnp/distros/fedora.sh is a stub)"; }
 fedora_ca_trust_refresh() { die "Fedora/RHEL adapter is not implemented yet (libsnp/distros/fedora.sh is a stub)"; }
 fedora_guest_pkg_install() { die "Fedora/RHEL adapter is not implemented yet (libsnp/distros/fedora.sh is a stub)"; }
+fedora_guest_repo_add() { die "Fedora/RHEL adapter is not implemented yet (libsnp/distros/fedora.sh is a stub)"; }

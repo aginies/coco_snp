@@ -130,7 +130,12 @@ cmd_clean() {
     require_root
     log "=== Cleaning up SEV-SNP attestation environment ==="
 
-    if ! confirm "Stop Trustee services and destroy/undefine VM '${VM_NAME}'?"; then
+    # Clean both the SNP VM and the --no-snp comparison VM (when distinct):
+    # either may exist, and the user should not have to run clean twice.
+    local vm_list=("$VM_NAME")
+    [[ "$VM_NO_SNP_NAME" != "$VM_NAME" ]] && vm_list+=("$VM_NO_SNP_NAME")
+
+    if ! confirm "Stop Trustee services and destroy/undefine VM(s) '${vm_list[*]}'?"; then
         log "Clean aborted."
         return 0
     fi
@@ -143,22 +148,25 @@ cmd_clean() {
         fi
     done
 
-    if virsh dominfo "$VM_NAME" >/dev/null 2>&1; then
-        log "Destroying VM ${VM_NAME}"
-        run virsh destroy "$VM_NAME" || true
-        log "Undefining VM ${VM_NAME}"
-        if virsh undefine "$VM_NAME" 2>/dev/null; then
-            log "VM undefined"
-        elif virsh undefine --nvram "$VM_NAME" 2>/dev/null; then
-            log "VM undefined (with NVRAM)"
+    local vm
+    for vm in "${vm_list[@]}"; do
+        if virsh dominfo "$vm" >/dev/null 2>&1; then
+            log "Destroying VM ${vm}"
+            run virsh destroy "$vm" || true
+            log "Undefining VM ${vm}"
+            if virsh undefine "$vm" 2>/dev/null; then
+                log "VM ${vm} undefined"
+            elif virsh undefine --nvram "$vm" 2>/dev/null; then
+                log "VM ${vm} undefined (with NVRAM)"
+            else
+                warn "Failed to undefine VM ${vm}"
+            fi
         else
-            warn "Failed to undefine VM ${VM_NAME}"
+            log "VM ${vm} not found, skipping"
         fi
-    else
-        log "VM ${VM_NAME} not found, skipping"
-    fi
+    done
 
-    log "Clean complete. Disk image kept at ${VM_DISK_PATH} (remove manually if desired)."
+    log "Clean complete. Disk images kept at ${VM_DISK_PATH} and ${VM_NO_SNP_DISK_PATH} (remove manually if desired)."
     log "Also kept: /etc/trustee (keys, policy), /etc/grpc-as.json, /etc/kbs.json, /etc/rvps.json,"
     log "systemd drop-ins (kbs.service.d, grpc-as.service.d), ${SNP_CERT_DIR}, ${SSH_KEY}."
 }
@@ -386,6 +394,9 @@ parse_args() {
             VM_NAME="$2"
             VM_DISK_PATH="/var/lib/libvirt/images/${VM_NAME}.qcow2"
             VM_XML_PATH="/var/lib/libvirt/${VM_NAME}.xml"
+            # --vm-name names *the* VM, whether or not --no-snp is in play
+            # (option order must not matter), so the no-SNP paths follow it too.
+            VM_NO_SNP_NAME="$2"
             VM_NO_SNP_DISK_PATH="/var/lib/libvirt/images/${VM_NO_SNP_NAME}.qcow2"
             VM_NO_SNP_XML_PATH="/var/lib/libvirt/${VM_NO_SNP_NAME}.xml"
             shift

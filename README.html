@@ -227,7 +227,7 @@ cd coco_snp-1.0.0</pre>
   <li><strong>Fetches the AMD KDS certificate chain</strong> (ARK, ASK, VCEK) into the local store (<code>/var/lib/sev-snp/certs/</code>).</li>
 </ol>
 <ul>
-  <li><em>Why:</em> verification needs the root chain. In the default <code>kds</code> mode the chain is fetched from AMD's global KDS (<code>https://kdsintf.amd.com/vcek/v1/SEV_SNP</code>). In <code>offline</code> mode the store must already be populated (see <a href="#step-11--air-gapped--offline-setup-optional">Step 11</a>).</li>
+  <li><em>Why:</em> verification needs the root chain. In the default <code>kds</code> mode the chain is fetched from AMD's global KDS (<code>https://kdsintf.amd.com/vcek/v1</code>). In <code>offline</code> mode the store must already be populated (see <a href="#step-11--air-gapped--offline-setup-optional">Step 11</a>).</li>
   <li><em>Why a local store:</em> CoCo-AS and <code>snphost</code> read the chain from disk at verification time; caching it locally also makes re-runs fast and lets an air-gapped host verify without internet.</li>
 </ul>
 <ol>
@@ -701,7 +701,7 @@ sudo ./snp-attest.sh secret-set --file /tmp/my-secret --path default/test/secret
   <li><strong>ASK</strong> — AMD Signing Key certificate (signed by the ARK)</li>
   <li><strong>VCEK</strong> — the VM Certificate Key certificate for your guest (signed by the ASK), fetched for the specific launch identity</li>
 </ul>
-<p>Without the offline store, the SNP stack fetches collateral from AMD KDS at runtime (<code>https://kdsintf.amd.com/vcek/v1/SEV_SNP</code>). With the offline store, it reads from <code>/var/lib/sev-snp/certs/</code> instead.</p>
+<p>Without the offline store, the SNP stack fetches collateral from AMD KDS at runtime (<code>https://kdsintf.amd.com/vcek/v1</code>). With the offline store, it reads from <code>/var/lib/sev-snp/certs/</code> instead.</p>
 <div class="callout info">
   <strong>SEV-SNP vs TDX offline:</strong> TDX needs a full <strong>PCCS</strong> server (Node.js + SQLite) to cache PCK/TCB/QE collateral, plus a one-time <strong>platform registration</strong> while online. SEV-SNP needs <strong>neither</strong> — just the three PEM files. There is no per-platform registration to do while online, which makes the air-gapped transition much simpler.
 </div>

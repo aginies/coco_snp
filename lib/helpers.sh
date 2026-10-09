@@ -91,10 +91,14 @@ ensure_grpcurl() {
         fi
     fi
 
-    die "grpcurl is required to communicate with CoCo-AS gRPC. Install the package
+    # Return non-zero instead of dying: 'setup-host' treats a missing grpcurl
+    # as deferrable (it is only needed later, by 'attest'), while 'attest'
+    # turns this into a hard error itself.
+    error "grpcurl is required to communicate with CoCo-AS gRPC. Install the package
   $(distro_pkg_manager) in grpcurl
 or the prebuilt binary:
   curl -sSL https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_x86_64.tar.gz | sudo tar -xz -C /usr/local/bin grpcurl"
+    return 1
 }
 
 # Ensure the CoCo-AS attestation.proto file is accessible for grpcurl
@@ -314,17 +318,17 @@ find_snp_ovmf() {
 # the local certificate store is populated). Returns 0 on success.
 probe_kds_url() {
     local url="$1"
-    # The KDS VCEK API is a GET endpoint. Probe the base URL and a known
-    # sub-path; accept any HTTP response (200/400/404) as "reachable".
+    # The KDS VCEK API is a GET endpoint. Probe a known public cert_chain path
+    # (returns 200 on official AMD KDS) or accept any valid HTTP response from the base.
     local base="${url%/}"
     local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$base" 2>/dev/null || echo "000")
-    if [[ "$code" == "200" || "$code" == "400" || "$code" == "404" || "$code" == "401" ]]; then
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${base}/Milan/cert_chain" 2>/dev/null || echo "000")
+    if [[ "$code" == "200" ]]; then
         return 0
     fi
-    # Some KDS deployments only answer on the /vcek/... path.
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${base}/ark" 2>/dev/null || echo "000")
-    if [[ "$code" == "200" || "$code" == "400" || "$code" == "404" || "$code" == "401" ]]; then
+    # Base URL probe (handles custom/proxy KDS mirrors)
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$base" 2>/dev/null || echo "000")
+    if [[ "$code" =~ ^[2-5][0-9][0-9]$ ]]; then
         return 0
     fi
     return 1

@@ -47,7 +47,7 @@ fetch_kds_certs() {
     # AMD's KDS, and they write ark.pem / ask.pem / vcek.pem straight into the
     # target directory — exactly the layout SNP_*_CERT expects, so no
     # post-fetch normalization is needed.
-    if [[ "$KDS_URL" != "https://kdsintf.amd.com/vcek/v1/SEV_SNP" ]]; then
+    if [[ "$KDS_URL" != "https://kdsintf.amd.com/vcek/v1" ]]; then
         warn "--kds-url (${KDS_URL}) is not honoured by 'snphost fetch' (it has no such option);"
         warn "it is only used for the CoCo-AS collateral_service setting and the reachability probe."
     fi
@@ -58,8 +58,8 @@ fetch_kds_certs() {
         return 1
     fi
     log "Fetching this platform's VCEK from KDS into ${SNP_CERT_DIR}"
-    if ! run snphost fetch vcek pem "$SNP_CERT_DIR"; then
-        warn "snphost fetch vcek failed (network? KDS unreachable?)."
+    if ! (run snphost fetch vek pem "$SNP_CERT_DIR" 2>/dev/null || run snphost fetch vcek pem "$SNP_CERT_DIR"); then
+        warn "snphost fetch vek/vcek failed (network? KDS unreachable?)."
         warn "If this host is air-gapped, use --collateral offline with a pre-populated store."
         return 1
     fi
@@ -74,6 +74,23 @@ fetch_kds_certs() {
         log "VLEK hashstick verified (Turin+ platform)"
     fi
     return 0
+}
+
+# Install a Trustee config file with the tightest ownership that still lets
+# the daemon read it. When the packaged service account does not exist (the
+# unit may run as root, or with DynamicUser), a 0600 root-owned file would be
+# unreadable to the daemon, so fall back to 0644. These files hold paths and
+# endpoints, not key material — the private keys they point at keep their own
+# 0600 permissions.
+secure_trustee_conf() {
+    local path="$1" owner="$2"
+    if id "$owner" >/dev/null 2>&1; then
+        run chown "${owner}:${owner}" "$path"
+        run chmod 600 "$path"
+    else
+        warn "Service account '${owner}' not present; leaving ${path} readable (0644) so the daemon can load it."
+        run chmod 644 "$path"
+    fi
 }
 
 # Select the collateral source (method 1 = KDS, method 2 = offline) and prepare
@@ -124,8 +141,14 @@ cmd_setup_host() {
     fi
 
     # Always (re)fetch/verify the certificate chain so the selected collateral
-    # source (KDS or offline) is what the verifier actually uses.
-    setup_collateral_source
+    # source (KDS or offline) is what the verifier actually uses. Failing here
+    # is fatal: without the chain neither snphost nor CoCo-AS can verify a
+    # report. Say so explicitly instead of letting the ERR trap fire on a
+    # bare non-zero return.
+    setup_collateral_source ||
+        die "Could not prepare the attestation collateral (--collateral ${COLLATERAL_MODE}).
+Fix the KDS connectivity (see the warnings above), or populate ${SNP_CERT_DIR}
+on another machine and re-run with --collateral offline."
 
     log "Verifying installed SNP packages"
     run distro_pkg_list_all | grep -Ei 'snp|sev' || warn "No SNP packages matched"
@@ -189,7 +212,9 @@ cmd_setup_trustee() {
         fi
     fi
 
-    setup_collateral_source
+    setup_collateral_source ||
+        die "Could not prepare the attestation collateral (--collateral ${COLLATERAL_MODE});
+CoCo-AS would be configured against a source it cannot use."
     local as_collateral
     as_collateral=$(kds_url)
     log "Writing CoCo-AS config: $GRPC_AS_CONF"
@@ -251,10 +276,7 @@ ${verifier_block}
   }
 }
 EOF
-    if id coco_as >/dev/null 2>&1; then
-        run chown coco_as:coco_as "$GRPC_AS_CONF"
-    fi
-    run chmod 600 "$GRPC_AS_CONF"
+    secure_trustee_conf "$GRPC_AS_CONF" coco_as
 
     # Admin keypair + resource policy: required for KBS to accept secrets and to
     # gate their release on attestation.
@@ -312,10 +334,9 @@ EOF
 }
 EOF
     if id coco_kbs >/dev/null 2>&1; then
-        run chown coco_kbs:coco_kbs "$KBS_CONF"
         run chown coco_kbs:coco_kbs "$KBS_ADMIN_PUB" "$KBS_POLICY" 2>/dev/null || true
     fi
-    run chmod 600 "$KBS_CONF"
+    secure_trustee_conf "$KBS_CONF" coco_kbs
     mkdir -p "${AS_STORAGE_DIR}/kbs" "${AS_STORAGE_DIR}/rvps"
     if id coco_kbs >/dev/null 2>&1; then
         run chown coco_kbs:coco_kbs "${AS_STORAGE_DIR}/kbs"
@@ -324,17 +345,20 @@ EOF
         run chown coco_rvps:coco_rvps "${AS_STORAGE_DIR}/rvps"
     fi
 
-    log "Writing RVPS config: $RVPS_CONF"
+    # NOTE: grpc-as above is configured with "rvps_config": {"type":"BuiltIn"},
+    # so the reference-value store runs *in-process* inside grpc-as and the
+    # register-rv / query-rv commands talk to it over the CoCo-AS endpoint.
+    # The standalone rvps.service and this config file are therefore optional
+    # — they are written and started when the distro ships the unit, but
+    # nothing in this script depends on them (see verify_service_optional).
+    log "Writing RVPS config: $RVPS_CONF (standalone RVPS; optional)"
     cat >"$RVPS_CONF" <<EOF
 {
   "storage_type": "LocalFs",
   "storage_dir": "${AS_STORAGE_DIR}/rvps"
 }
 EOF
-    if id coco_rvps >/dev/null 2>&1; then
-        run chown coco_rvps:coco_rvps "$RVPS_CONF"
-    fi
-    run chmod 600 "$RVPS_CONF"
+    secure_trustee_conf "$RVPS_CONF" coco_rvps
 
     log "Starting Trustee services"
     # SUSE kbs.service ExecStart omits --config-file; override it to point at
@@ -349,11 +373,14 @@ EOF
     # not expand it, and the CLI flag is --config-file (not --config). So grpc-as
     # runs with no config file -> default config -> ephemeral signer -> no JWKS
     # endpoint. Override ExecStart to pass the config explicitly.
+    # --socket is passed too: the listen address is a CLI argument, not a
+    # config field, so without it --coco-as would only change where KBS and
+    # the attest command *dial*, not where grpc-as actually listens.
     mkdir -p /etc/systemd/system/grpc-as.service.d
     cat >/etc/systemd/system/grpc-as.service.d/override.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=$(distro_grpc_as_bin) --config-file /etc/grpc-as.json
+ExecStart=$(distro_grpc_as_bin) --socket ${COCO_AS} --config-file /etc/grpc-as.json
 EOF
     if [[ -n "${https_proxy:-${HTTPS_PROXY:-}}" ]]; then
         cat >>/etc/systemd/system/grpc-as.service.d/override.conf <<EOF
@@ -556,10 +583,15 @@ ensure_as_signer_key() {
   ]
 }
 EOF
+    # KBS reads the JWKS at startup; a 0640 root-owned file is unreadable to
+    # it when the packaged account is absent, so widen to 0644 in that case
+    # (a JWK Set is public key material by definition).
     if id coco_kbs >/dev/null 2>&1; then
         run chown coco_kbs:coco_kbs "$KBS_JWKS_FILE"
+        run chmod 640 "$KBS_JWKS_FILE"
+    else
+        run chmod 644 "$KBS_JWKS_FILE"
     fi
-    run chmod 640 "$KBS_JWKS_FILE"
 }
 
 # Write a permissive resource-access policy (LAB DEFAULT: allow all).

@@ -34,17 +34,39 @@
 #include <unistd.h>
 
 // --- /dev/sev-guest ioctl interface (mirrors include/uapi/linux/sev-guest.h) ---
-// Defined inline so the build does not depend on the kernel header being
-// present; the layout is stable across kernel versions that support SEV-SNP.
-#define SEV_GUEST_IOC_MAGIC 0x12
-#define SNP_GUEST_REPORT _IOWR(SEV_GUEST_IOC_MAGIC, 1, struct sev_snp_guest_report)
+#if __has_include(<linux/sev-guest.h>)
+#include <linux/sev-guest.h>
+#endif
 
-struct sev_snp_guest_report {
-    uint64_t data;       // __user pointer to the report_data buffer
-    uint64_t len;        // length of report_data (must be <= 64)
-    uint64_t report;     // __user pointer to the report buffer
-    uint64_t report_len; // length of the report buffer (must be >= 4000)
+#ifndef SNP_GET_REPORT
+#define SNP_GUEST_REQ_IOC_TYPE 'S'
+#define SNP_REPORT_USER_DATA_SIZE 64
+
+struct snp_report_req {
+    uint8_t user_data[SNP_REPORT_USER_DATA_SIZE];
+    uint32_t vmpl;
+    uint8_t rsvd[28];
 };
+
+struct snp_report_resp {
+    uint8_t data[4000];
+};
+
+struct snp_guest_request_ioctl {
+    uint8_t msg_version;
+    uint64_t req_data;
+    uint64_t resp_data;
+    union {
+        uint64_t exitinfo2;
+        struct {
+            uint32_t fw_error;
+            uint32_t vmm_error;
+        };
+    };
+};
+
+#define SNP_GET_REPORT _IOWR(SNP_GUEST_REQ_IOC_TYPE, 0x0, struct snp_guest_request_ioctl)
+#endif
 
 // A SEV-SNP attestation report is 4000 bytes (the CPU PSP signs it).
 #define SNP_REPORT_SIZE 4000
@@ -82,19 +104,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Allocate the report buffer (zero-filled; the PSP fills it in).
-    unsigned char report[SNP_REPORT_SIZE];
-    memset(report, 0, sizeof(report));
+    struct snp_report_req req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.user_data, report_data, sizeof(req.user_data));
+    req.vmpl = 0;
 
-    struct sev_snp_guest_report req = {
-        .data = (uint64_t)(uintptr_t)report_data,
-        .len = sizeof(report_data),
-        .report = (uint64_t)(uintptr_t)report,
-        .report_len = sizeof(report),
-    };
+    struct snp_report_resp resp;
+    memset(&resp, 0, sizeof(resp));
 
-    if (ioctl(fd, SNP_GUEST_REPORT, &req) < 0) {
-        fprintf(stderr, "Error: SNP_GUEST_REPORT ioctl failed: %s\n", strerror(errno));
+    struct snp_guest_request_ioctl guest_req;
+    memset(&guest_req, 0, sizeof(guest_req));
+    guest_req.msg_version = 1;
+    guest_req.req_data = (uint64_t)(uintptr_t)&req;
+    guest_req.resp_data = (uint64_t)(uintptr_t)&resp;
+
+    if (ioctl(fd, SNP_GET_REPORT, &guest_req) < 0) {
+        fprintf(stderr, "Error: SNP_GET_REPORT ioctl failed: %s (fw_error=%u, vmm_error=%u)\n",
+                strerror(errno), guest_req.fw_error, guest_req.vmm_error);
         close(fd);
         return 1;
     }
@@ -106,7 +132,7 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
-    if (fwrite(report, 1, SNP_REPORT_SIZE, out) != SNP_REPORT_SIZE) {
+    if (fwrite(resp.data, 1, sizeof(resp.data), out) != sizeof(resp.data)) {
         fprintf(stderr, "Error: short write to %s\n", argv[2]);
         fclose(out);
         close(fd);
@@ -115,6 +141,6 @@ int main(int argc, char **argv) {
     fclose(out);
     close(fd);
 
-    printf("Wrote %d-byte SEV-SNP report to %s\n", SNP_REPORT_SIZE, argv[2]);
+    printf("Wrote %zu-byte SEV-SNP report to %s\n", sizeof(resp.data), argv[2]);
     return 0;
 }

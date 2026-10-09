@@ -56,6 +56,7 @@ generate_vm_xml() {
     local memtune_line=""
     local resource_line=""
     local extra_devices=""
+    local memballoon_line=""
 
     if ((VM_NO_SNP)); then
         # --- Non-SNP mode: regular UEFI VM for testing without SNP hardware ---
@@ -74,6 +75,7 @@ generate_vm_xml() {
         rng_line="    <rng model='virtio'>
       <backend model='random'>/dev/urandom</backend>
     </rng>"
+        memballoon_line="    <memballoon model='virtio'/>"
         firmware_attr=""
     else
         # SNP mode: rely on libvirt firmware autoselection (no explicit
@@ -117,9 +119,9 @@ generate_vm_xml() {
     <audio id='1' type='none'/>
     <watchdog model='itco' action='reset'/>
     <channel type='unix'>
-      <source mode='bind' path='/run/libvirt/qemu/channel/domain-${VM_DISPLAY_NAME}/org.qemu.guest_agent.0'/>
       <target type='virtio' name='org.qemu.guest_agent.0'/>
     </channel>"
+        memballoon_line="    <memballoon model='none'/>"
     fi
 
     cat >"$xml_path" <<EOF
@@ -189,7 +191,7 @@ ${launchsec_line}
     </video>
 ${vsock_line}
 ${extra_devices}
-    <memballoon model='virtio'/>
+${memballoon_line}
 ${rng_line}
   </devices>
 </domain>
@@ -289,19 +291,32 @@ extract_installer_media() {
         rmdir "${mnt}"
         die "Cannot loop-mount the installer ISO to extract the installer kernel: ${iso}"
     fi
-    local d
+    # Kernel and initrd file names differ per distro family: SUSE ships
+    # loader/{linux,initrd}, Fedora/RHEL ship pxeboot/{vmlinuz,initrd.img}.
+    # Probe both names in both directories instead of assuming one layout.
+    local d k i
     for d in "boot/x86_64/loader" "images/pxeboot"; do
-        if [[ -f "${mnt}/${d}/linux" || -f "${mnt}/${d}/vmlinuz" ]]; then
-            ksrc="${d}/$([[ -f "${mnt}/${d}/linux" ]] && echo linux || echo vmlinuz)"
-            isrc="${d}/initrd"
-            break
-        fi
+        for k in linux vmlinuz; do
+            [[ -f "${mnt}/${d}/${k}" ]] || continue
+            for i in initrd initrd.img; do
+                if [[ -f "${mnt}/${d}/${i}" ]]; then
+                    ksrc="${d}/${k}"
+                    isrc="${d}/${i}"
+                    break
+                fi
+            done
+            if [[ -n "${ksrc}" ]]; then break; fi
+        done
+        if [[ -n "${ksrc}" ]]; then break; fi
     done
-    if [[ -z "${ksrc}" || ! -f "${mnt}/${isrc}" ]]; then
+    if [[ -z "${ksrc}" || -z "${isrc}" ]]; then
         umount "${mnt}" 2>/dev/null
         rmdir "${mnt}"
-        die "No installer kernel found in the ISO (looked in boot/x86_64/loader and images/pxeboot)."
+        die "No installer kernel+initrd pair found in the ISO (looked for {linux,vmlinuz} + {initrd,initrd.img} in boot/x86_64/loader and images/pxeboot)."
     fi
+    # /var/lib/libvirt/boot does not exist on a fresh install until something
+    # creates it; libvirt only needs it to be present and root-owned.
+    mkdir -p /var/lib/libvirt/boot
     INSTALLER_KERNEL="/var/lib/libvirt/boot/${VM_DISPLAY_NAME}-installer-kernel"
     INSTALLER_INITRD="/var/lib/libvirt/boot/${VM_DISPLAY_NAME}-installer-initrd"
     cp "${mnt}/${ksrc}" "${INSTALLER_KERNEL}"
@@ -364,7 +379,7 @@ build_virt_install_cmd() {
         if [[ -z "${ovmf_bin}" ]]; then
             die "No SNP OVMF firmware found; cannot build virt-install command."
         fi
-        cmd+=(--machine q35)
+        cmd+=(--machine q35 --memballoon none)
     fi
     local iso_path="${GUEST_ISO}"
     if [[ -f "${iso_path}" ]]; then
@@ -432,11 +447,19 @@ if vms is not None:
     ls.remove(vms)
 
 devices = find('devices')
-if devices is not None and devices.find('vsock') is None:
-    vs = ET.SubElement(devices, 'vsock')
-    vs.set('model', 'virtio')
-    cid = ET.SubElement(vs, 'cid')
-    cid.set('auto', 'yes')
+if devices is not None:
+    if devices.find('vsock') is None:
+        vs = ET.SubElement(devices, 'vsock')
+        vs.set('model', 'virtio')
+        cid = ET.SubElement(vs, 'cid')
+        cid.set('auto', 'yes')
+    # SEV-SNP does not support memory ballooning: disable memballoon
+    mb = devices.find('memballoon')
+    if mb is None:
+        mb = ET.SubElement(devices, 'memballoon')
+    mb.set('model', 'none')
+    for child in list(mb):
+        mb.remove(child)
 
 pm = find('pm')
 if pm is None:
@@ -457,10 +480,18 @@ inject_ssh_key_disk() {
         log "Injecting SSH key into guest image via virt-customize"
         local pub_key
         pub_key=$(cat "${SSH_KEY}.pub")
+        # The key must land in GUEST_USER's home, not unconditionally in
+        # /root: ssh_guest connects as ${GUEST_USER}. PermitRootLogin is only
+        # relevant when that user *is* root.
+        local guest_home="/home/${GUEST_USER}" root_conf="true"
+        if [[ "$GUEST_USER" == "root" ]]; then
+            guest_home="/root"
+            root_conf="mkdir -p /etc/ssh/sshd_config.d && printf 'PermitRootLogin yes\n' > /etc/ssh/sshd_config.d/root.conf && chmod 644 /etc/ssh/sshd_config.d/root.conf"
+        fi
         run virt-customize -a "$VM_DISK_PATH" \
-            --run-command "mkdir -p /root/.ssh && chmod 700 /root/.ssh" \
-            --run-command "touch /root/.ssh/authorized_keys; grep -qxF '${pub_key}' /root/.ssh/authorized_keys || echo '${pub_key}' >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys" \
-            --run-command "mkdir -p /etc/ssh/sshd_config.d && printf 'PermitRootLogin yes\n' > /etc/ssh/sshd_config.d/root.conf && chmod 644 /etc/ssh/sshd_config.d/root.conf" \
+            --run-command "mkdir -p ${guest_home}/.ssh && chmod 700 ${guest_home}/.ssh" \
+            --run-command "touch ${guest_home}/.ssh/authorized_keys; grep -qxF '${pub_key}' ${guest_home}/.ssh/authorized_keys || echo '${pub_key}' >> ${guest_home}/.ssh/authorized_keys; chmod 600 ${guest_home}/.ssh/authorized_keys; chown -R ${GUEST_USER}: ${guest_home}/.ssh 2>/dev/null || true" \
+            --run-command "${root_conf}" \
             --run-command "mkdir -p /etc/systemd/system && for t in sleep.target suspend.target hibernate.target hybrid-sleep.target; do ln -sf /dev/null /etc/systemd/system/\$t; done" \
             --run-command "mkdir -p /etc/systemd/logind.conf.d && printf '[Login]\nHandleSuspendKey=ignore\nHandleHibernateKey=ignore\nHandleLidSwitch=ignore\n' > /etc/systemd/logind.conf.d/snp-no-suspend.conf"
         log "SSH key injected (user: ${GUEST_USER})"
@@ -565,8 +596,11 @@ Reinstall qemu with SNP target (package: $(distro_pkgs qemu))."
     local disk_has_os=0
     if [[ -f "$VM_DISK_PATH" ]]; then
         warn "Disk already exists, reusing: ${VM_DISK_PATH}"
+        # NB: virt-filesystems has --all and --long; there is no --long-only.
+        # Passing an unknown flag makes it exit non-zero, which silently
+        # demoted every reused disk to "fresh" and skipped SSH key injection.
         if command -v virt-filesystems >/dev/null 2>&1 &&
-            virt-filesystems -a "$VM_DISK_PATH" --all --long-only 2>/dev/null | grep -q .; then
+            virt-filesystems -a "$VM_DISK_PATH" --all --long 2>/dev/null | grep -q .; then
             disk_has_os=1
         else
             warn "Disk contains no filesystem (leftover from an aborted install?) — treating as fresh."
@@ -974,23 +1008,17 @@ See doc: snp-guest-setup troubleshooting."
         ssh_guest "mkdir -p ${GUEST_WORKDIR}"
 
     log "Checking attestation libraries + KBS client in guest"
-    # The SNP attestation packages are not (yet) in the default SLES 16.1
-    # repos — add the Virtualization:SGX repo in the guest and refresh first.
-    log "Ensuring ${SNP_REPO_NAME} repository in guest: ${SNP_REPO_URL}"
-    ssh_guest "sudo bash -s" <<EOF
-set -e
-if ! zypper lr | grep -Eq "^[0-9]+[[:space:]]*\|[[:space:]]*${SNP_REPO_NAME}[[:space:]]*\|"; then
-    zypper --non-interactive addrepo ${SNP_REPO_URL} ${SNP_REPO_NAME}
-fi
-key=\$(mktemp)
-if curl -fsSL ${SNP_REPO_URL}repodata/repomd.xml.key -o "\$key"; then
-    rpm --import "\$key"
-fi
-rm -f "\$key"
-zypper refresh
-EOF
+    # The SNP attestation packages are not (yet) in every distro's default
+    # repos — let the guest adapter register whatever extra repo it needs.
+    log "Ensuring the SNP package repository is registered in the guest"
+    guest_distro_repo_add
+
+    # Both package sets are needed here: snp_guest provides snpguest, trustee
+    # provides the kbs-client with the SNP attester that the check below
+    # insists on. Installing only the former made setup-guest die on a guest
+    # it had everything it needed to fix.
     # shellcheck disable=SC2046
-    install_pkgs_guest $(guest_distro_pkgs snp_guest)
+    install_pkgs_guest $(guest_distro_pkgs snp_guest) $(guest_distro_pkgs trustee)
 
     log "Verifying snpguest in guest"
     local snpguest_bin
@@ -1011,24 +1039,19 @@ EOF
     fi
     ssh_guest "sudo rm -f ${KBS_CLIENT_GUEST_LEGACY}" 2>/dev/null || true
 
-    # snp-report-gen: report generator that binds caller-specified report data
-    # (required for host-mode secret-get; the distro's 'snpguest report' uses
-    # random report_data by default). Built from tools/snp-report-gen.c.
+    # Report generation: upstream 'snpguest report' natively supports both
+    # random nonces and custom caller-specified report_data (used for TEE key binding).
+    # snp-report-gen (tools/snp-report-gen.c) is an optional C helper built only
+    # if gcc is present.
     if ssh_guest "test -x ${SNP_REPORT_GEN_GUEST}"; then
-        log "snp-report-gen present in guest"
-    else
-        log "Building snp-report-gen in guest (needs gcc)"
-        if ! ssh_guest "command -v gcc" >/dev/null 2>&1; then
-            log "Installing gcc in guest (zypper)"
-            install_pkgs_guest gcc ||
-                die "Failed to install gcc in guest (needed to build snp-report-gen)"
+        log "snp-report-gen present in guest: ${SNP_REPORT_GEN_GUEST}"
+    elif ssh_guest "command -v gcc" >/dev/null 2>&1 && [[ -f "${SCRIPT_DIR}/tools/snp-report-gen.c" ]]; then
+        log "Building optional snp-report-gen in guest"
+        if ssh_guest "cat > ${GUEST_WORKDIR}/snp-report-gen.c" <"${SCRIPT_DIR}/tools/snp-report-gen.c" 2>/dev/null; then
+            ssh_guest "gcc -O2 -o ${GUEST_WORKDIR}/snp-report-gen ${GUEST_WORKDIR}/snp-report-gen.c 2>/dev/null && sudo install -m 0755 ${GUEST_WORKDIR}/snp-report-gen ${SNP_REPORT_GEN_GUEST} 2>/dev/null" || true
         fi
-        ssh_guest "cat > ${GUEST_WORKDIR}/snp-report-gen.c" \
-            <"${SCRIPT_DIR}/tools/snp-report-gen.c" ||
-            die "Failed to copy tools/snp-report-gen.c to guest (is the tools/ directory present?)"
-        ssh_guest "gcc -O2 -o ${SNP_REPORT_GEN_GUEST} ${GUEST_WORKDIR}/snp-report-gen.c" ||
-            die "Failed to build snp-report-gen in guest"
-        log "snp-report-gen installed in guest: ${SNP_REPORT_GEN_GUEST}"
+    else
+        log "Using native snpguest for guest report generation (standard upstream tooling)"
     fi
 
     # Ship the certificate chain to the guest so 'snpguest verify attestation'

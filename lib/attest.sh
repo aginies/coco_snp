@@ -26,7 +26,7 @@ attest_evaluate_report() {
     local report_b64="$1"
     local runtime_data_json="${2:-}"
     require_cmd base64
-    ensure_grpcurl
+    ensure_grpcurl || die "grpcurl is required for attestation (see the hint above)."
     ensure_attestation_proto
 
     [[ -n "$report_b64" ]] || die "Empty report passed to attest_evaluate_report"
@@ -135,10 +135,14 @@ attest_get_ear_token_with_tee_key() {
     local report_data_hex="${digest}00000000000000000000000000000000"
 
     log "Binding report to TEE key (report_data = sha384(runtime data))"
-    # snp-report-gen (installed by setup-guest) binds the given 64-byte
-    # report data into the generated report.
-    ssh_guest "cd ${GUEST_WORKDIR} && ${SNP_REPORT_GEN_GUEST} ${report_data_hex} report.dat" ||
-        die "Failed to generate a report bound to the TEE key. Is ${SNP_REPORT_GEN_GUEST} installed in the guest? Re-run: setup-guest --guest-ip <GUEST_IP>"
+    # Write the 64-byte raw binary request-data and use standard upstream
+    # 'snpguest report' (without --random, it binds the provided request data).
+    # Fall back to snp-report-gen if available.
+    local gen_cmd
+    gen_cmd="python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(\"${report_data_hex}\"))' > request-data.bin && snpguest report report.dat request-data.bin --vmpl 0"
+    if ! ssh_guest "cd ${GUEST_WORKDIR} && ( ${gen_cmd} || (${SNP_REPORT_GEN_GUEST} ${report_data_hex} report.dat 2>/dev/null) )"; then
+        die "Failed to generate a report bound to the TEE key on guest"
+    fi
 
     log "Fetching report (base64)"
     local report_b64
@@ -456,9 +460,11 @@ except Exception:
 guest_generate_report() {
     local out rc=0
     # snpguest takes its paths positionally: 'report <att-report> <request>'.
+    # Explicitly pass --vmpl 0 so the report matches the guest privilege level
+    # (snpguest defaults to --vmpl 1 without this flag).
     # --random fills the 64-byte request (report_data) with fresh entropy, so
     # each report carries its own nonce.
-    out=$(ssh_guest "cd ${GUEST_WORKDIR} && snpguest report report.dat request-data.txt --random" 2>&1) || rc=$?
+    out=$(ssh_guest "cd ${GUEST_WORKDIR} && snpguest report report.dat request-data.txt --vmpl 0 --random" 2>&1) || rc=$?
     if ((rc != 0)); then
         local msg
         msg=$(grep -vE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] \[' <<<"$out" || true)

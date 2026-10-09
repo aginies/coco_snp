@@ -119,6 +119,24 @@ sles_ovmf_snp_probe() {
     return 1
 }
 
+# Add the SNP attestation repo inside the guest (the snpguest / trustee
+# packages are not in the default SLES 16.1 repos yet) and import its signing
+# key. Idempotent: an already-registered repo is left alone.
+sles_guest_repo_add() {
+    ssh_guest "sudo bash -s" <<EOF
+set -e
+if ! zypper lr | grep -Eq "^[0-9]+[[:space:]]*\|[[:space:]]*${SNP_REPO_NAME}[[:space:]]*\|"; then
+    zypper --non-interactive addrepo ${SNP_REPO_URL} ${SNP_REPO_NAME}
+fi
+key=\$(mktemp)
+if curl -fsSL ${SNP_REPO_URL}repodata/repomd.xml.key -o "\$key"; then
+    rpm --import "\$key"
+fi
+rm -f "\$key"
+zypper refresh
+EOF
+}
+
 # Install packages inside the guest over ssh (single round-trip missing-check).
 sles_guest_pkg_install() {
     ssh_guest "missing=; for p in $*; do rpm -q \$p >/dev/null 2>&1 || missing=\"\$missing \$p\"; done

@@ -51,7 +51,7 @@ SNP_POLICY="0x30000"
 #                    over the public internet.
 # Method 2 (offline): use a locally-provisioned certificate store (air-gapped);
 #                    import the chain once with 'snphost import' and reuse it.
-KDS_URL="${KDS_URL:-https://kdsintf.amd.com/vcek/v1/SEV_SNP}"
+KDS_URL="${KDS_URL:-https://kdsintf.amd.com/vcek/v1}"
 # Local offline certificate store (method 2). 'snphost import' writes the
 # ARK/ASK/VCEK chain here; 'snphost' reads it back for verification.
 readonly SNP_CERT_DIR="/var/lib/sev-snp/certs"
