@@ -75,6 +75,10 @@ KBS_PORT=8080
 # KBS address reachable by BOTH host and guest (libvirt 'default' network).
 KBS_HOST="192.168.122.1"
 KBS_URL="" # derived from KBS_HOST:KBS_PORT if empty
+# Directory containing attestation.proto and reference.proto (resolved by ensure_attestation_proto)
+PROTO_DIR=""
+# Selected VM name (resolved by pick_vm_interactively)
+PICKED_VM_NAME=""
 
 # Secret delivery (KBS) defaults
 SECRET_PATH="default/test/secret"

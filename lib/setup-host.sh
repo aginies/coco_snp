@@ -382,10 +382,11 @@ EOF
 ExecStart=
 ExecStart=$(distro_grpc_as_bin) --socket ${COCO_AS} --config-file /etc/grpc-as.json
 EOF
-    if [[ -n "${https_proxy:-${HTTPS_PROXY:-}}" ]]; then
+    local effective_proxy="${https_proxy:-${HTTPS_PROXY:-}}"
+    if [[ -n "$effective_proxy" ]]; then
         cat >>/etc/systemd/system/grpc-as.service.d/override.conf <<EOF
-Environment="HTTPS_PROXY=${https_proxy:-$HTTPS_PROXY}"
-Environment="https_proxy=${https_proxy:-$HTTPS_PROXY}"
+Environment="HTTPS_PROXY=${effective_proxy}"
+Environment="https_proxy=${effective_proxy}"
 EOF
     fi
 

@@ -104,7 +104,9 @@ or the prebuilt binary:
 # Ensure the CoCo-AS attestation.proto file is accessible for grpcurl
 # (since production gRPC servers usually disable the reflection API).
 ensure_attestation_proto() {
+    local found_dir=""
     local candidate_dirs=(
+        ${PROTO_DIR:+"$PROTO_DIR"}
         "${SCRIPT_DIR}/protos"
         "${SCRIPT_DIR}"
         "/etc/trustee/protos"
@@ -115,13 +117,15 @@ ensure_attestation_proto() {
     )
     for dir in "${candidate_dirs[@]}"; do
         if [[ -f "${dir}/attestation.proto" ]]; then
-            PROTO_DIR="$dir"
+            found_dir="$dir"
             break
         fi
     done
 
     # Write embedded proto if not found on disk
-    if [[ -z "$PROTO_DIR" || ! -f "${PROTO_DIR}/attestation.proto" ]]; then
+    if [[ -n "$found_dir" ]]; then
+        PROTO_DIR="$found_dir"
+    else
         mkdir -p /var/tmp/trustee-protos
         cat >/var/tmp/trustee-protos/attestation.proto <<'EOF'
 syntax = "proto3";
@@ -179,7 +183,8 @@ EOF
             cp "${SCRIPT_DIR}/protos/reference.proto" "${PROTO_DIR}/" 2>/dev/null || true
         elif [[ -f "/etc/trustee/reference.proto" ]]; then
             cp "/etc/trustee/reference.proto" "${PROTO_DIR}/" 2>/dev/null || true
-        else
+        fi
+        if [[ ! -f "${PROTO_DIR}/reference.proto" ]]; then
             mkdir -p "${PROTO_DIR}"
             cat >"${PROTO_DIR}/reference.proto" <<'EOF'
 syntax = "proto3";
