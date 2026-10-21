@@ -430,6 +430,21 @@ for tag in ('loader', 'nvram'):
     el = os_.find(tag)
     if el is not None:
         os_.remove(el)
+
+# Drop any <firmware> feature-request element. A confidential SEV-SNP guest
+# can only use the firmware descriptor advertising 'amd-sev-snp' (e.g.
+# 61-ovmf-x86_64-sev-snp.json), which advertises ONLY 'amd-sev-snp'; it does
+# NOT advertise 'secure-boot' or 'enrolled-keys'. If <firmware> is left in
+# place, libvirt turns those into hard requirements (qemuFirmwareMatchDomain:
+# "User requested Secure Boot/Enrolled keys, firmware ... doesn't ...") and
+# rejects the only SNP-compatible descriptor, failing the define with
+# "Unable to find 'efi' firmware that is compatible with the current
+# configuration". For SNP, secure-boot state is enforced by the PSP (there is
+# no UEFI NVRAM to enroll into), so this non-confidential-UEFI element does
+# not apply and must be removed before firmware autoselection.
+fw = os_.find('firmware')
+if fw is not None:
+    os_.remove(fw)
 os_.set('firmware', 'efi')
 
 ls = find('launchSecurity')
