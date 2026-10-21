@@ -137,6 +137,29 @@ zypper refresh
 EOF
 }
 
+# Add the SNP attestation repo on the HOST (the snphost package is not in the
+# default SLES 16.1 repos yet) and import its signing key. Idempotent: an
+# already-registered repo is left alone. Mirrors sles_guest_repo_add but runs
+# locally (no ssh) so snphost installs/updates from the latest build.
+sles_host_repo_add() {
+    if ! zypper lr | grep -Eq "^[0-9]+[[:space:]]*\|[[:space:]]*${SNP_REPO_NAME}[[:space:]]*\|"; then
+        zypper --non-interactive addrepo ${SNP_REPO_URL} ${SNP_REPO_NAME}
+    fi
+    local key
+    key=$(mktemp)
+    if curl -fsSL ${SNP_REPO_URL}repodata/repomd.xml.key -o "$key"; then
+        rpm --import "$key"
+    fi
+    rm -f "$key"
+    zypper refresh
+}
+
+# Upgrade already-installed packages (e.g. snphost) to the latest build in the
+# configured repos. No-op when nothing is passed.
+sles_pkg_update() {
+    (( $# > 0 )) && run zypper update -y "$@"
+}
+
 # Install packages inside the guest over ssh (single round-trip missing-check).
 sles_guest_pkg_install() {
     ssh_guest "missing=; for p in $*; do rpm -q \$p >/dev/null 2>&1 || missing=\"\$missing \$p\"; done

@@ -305,12 +305,20 @@ install_pkgs_guest() {
     guest_distro_pkg_install "$@"
 }
 
-# Probe whether a guest kbs-client binary has the SNP attester compiled in.
-# A build WITH the feature references /dev/sev-guest; a build WITHOUT it
-# instead carries the string "`snp-attester` feature is not enabled!".
-# Static probe: no SNP VM, network, or binutils required.
+# Probe whether a guest kbs-client binary supports SNP attestation.
+#
+# The modern trustee 'kbs-client' is a UNIFIED binary that provides both the
+# SGX and SNP verifiers, so the old split-build heuristic (grep for the
+# /dev/sev-guest device string baked into the binary) is unreliable: a missing
+# string is a false negative even when SNP is fully supported.
+#
+# SNP attestation is actually governed by the snp_verifier (shipped with the
+# 'trustee' stack the guest installs, which loads it via grpc-as) and the SNP
+# report tool snpguest; either present means the guest is set up for SNP, so
+# the unified kbs-client can do SNP. Detect that instead of grepping a
+# hardcoded path. Static probe: no SNP VM, network, or binutils required.
 kbs_client_supports_snp_guest() { # guest-side: kbs_client_supports_snp_guest <guest-path>
-    ssh_guest "test -x '$1' && grep -aq '/dev/sev-guest' '$1'"
+    ssh_guest "test -x '$1' && { command -v snp_verifier >/dev/null 2>&1 || command -v snpguest >/dev/null 2>&1; }"
 }
 
 # Find a SNP-capable OVMF firmware (distro-specific probe, see lib/distros/).

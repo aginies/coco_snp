@@ -107,6 +107,10 @@ setup_collateral_source() {
 cmd_setup_host() {
     require_root
     require_cmd "$(distro_pkg_manager)"
+    # Register the SNP package repo on the host so snphost is installed/updated
+    # from the latest build (download.opensuse.org Virtualization:SGX) rather
+    # than a stale or missing one. Idempotent; a no-op if the repo already exists.
+    distro_repo_add
     log "=== Setting up SEV-SNP host (snphost stack) ==="
     step "Install snphost, verify host SEV-SNP, fetch KDS certificates, start libvirt" \
         "Enables the host to fetch the AMD certificate chain from the selected source (KDS or offline store); confirms SEV-SNP is active on the host (/dev/sev, kvm_amd)."
@@ -114,6 +118,9 @@ cmd_setup_host() {
     log "Checking SEV-SNP host attestation stack (snphost)"
     # shellcheck disable=SC2046  # deliberate word-splitting of the package list
     install_pkgs $(distro_pkgs snp_host)
+    # install_pkgs only installs when a package is missing; upgrade snphost to the
+    # latest build from the repo so the host bin is current.
+    distro_pkg_update $(distro_pkgs snp_host)
 
     local snphost_bin
     snphost_bin=$(distro_snp_host_bin)

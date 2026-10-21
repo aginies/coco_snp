@@ -21,6 +21,7 @@
 #   <id>_grub_snp_hint          -> echo the SEV-SNP kernel-cmdline hint
 #   <id>_ca_trust_refresh       -> refresh the host system trust store
 #   <id>_ca_trust_cmd           -> remote cmd (stdin=CA) to trust a CA in the guest
+#   <id>_host_repo_add          -> register the SNP package repo on the host
 #   <id>_guest_pkg_install <p...> -> install inside the guest over ssh
 #   <id>_guest_repo_add         -> register the SNP package repo in the guest
 #                                  (optional; omitted = no extra repo needed)
@@ -74,6 +75,21 @@ distro_pkgs() {
 distro_snp_host_bin() {
     local v="${DISTRO_ID}_snp_host_bin"
     echo "${!v:-}"
+}
+# Register the SNP package repo on the host (optional; omitted = no extra repo
+# needed). Called before installing snphost so it comes from the latest build.
+distro_repo_add() {
+    local hook="${DISTRO_ID}_host_repo_add"
+    if declare -F "$hook" >/dev/null 2>&1; then
+        "$hook"
+    else
+        log "No host repo hook for ${DISTRO_ID}; assuming SNP packages are in the default repos."
+    fi
+}
+# Update (upgrade) packages already present (e.g. snphost) to the latest build
+distro_pkg_update() {
+    local v="${DISTRO_ID}_pkg_update"
+    [[ -n "${!v:-}" ]] && "${!v}" "$@"
 }
 distro_kbs_bin() {
     local v="${DISTRO_ID}_kbs_bin"
