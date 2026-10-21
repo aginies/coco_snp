@@ -155,9 +155,11 @@ sles_host_repo_add() {
 }
 
 # Upgrade already-installed packages (e.g. snphost) to the latest build in the
-# configured repos. No-op when nothing is passed.
+# configured repos. No-op when nothing is passed (returns 0 so the ERR trap
+# stays quiet even if this is called with no arguments).
 sles_pkg_update() {
     (( $# > 0 )) && run zypper update -y "$@"
+    return 0
 }
 
 # Install packages inside the guest over ssh (single round-trip missing-check).

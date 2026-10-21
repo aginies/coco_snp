@@ -86,10 +86,14 @@ distro_repo_add() {
         log "No host repo hook for ${DISTRO_ID}; assuming SNP packages are in the default repos."
     fi
 }
-# Update (upgrade) packages already present (e.g. snphost) to the latest build
+# Update (upgrade) packages already present (e.g. snphost) to the latest build.
+# _pkg_update is a function (like _pkg_install), so call it directly -- not via
+# the ${!v} variable-indirection used by the _pkgs_<role> word-list variables.
 distro_pkg_update() {
-    local v="${DISTRO_ID}_pkg_update"
-    [[ -n "${!v:-}" ]] && "${!v}" "$@"
+    local hook="${DISTRO_ID}_pkg_update"
+    if declare -F "$hook" >/dev/null 2>&1; then
+        "$hook" "$@"
+    fi
 }
 distro_kbs_bin() {
     local v="${DISTRO_ID}_kbs_bin"
