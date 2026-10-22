@@ -82,20 +82,29 @@ attest_evaluate_report() {
 }
 EOF
 
-    local response=""
+    local response="" attempt=0 max_attempts=4
     log "Sending request via grpcurl to ${COCO_AS}"
-    if ! response=$(grpcurl -plaintext \
-        -import-path "$PROTO_DIR" \
-        -proto attestation.proto \
-        -d @ \
-        "${COCO_AS}" attestation.AttestationService/AttestationEvaluate <"$req_file" 2>&1); then
-        error "grpcurl call failed:"
-        echo "$response" >&2
+    # AMD KDS is intermittently unavailable: a VCEK fetch can fail transiently,
+    # especially for the back-to-back re-evaluation done by --register-rv.
+    # Retry a few times with a short backoff instead of failing immediately.
+    while ((attempt < max_attempts)); do
+        attempt=$((attempt + 1))
+        response=$(grpcurl -plaintext \
+            -import-path "$PROTO_DIR" \
+            -proto attestation.proto \
+            -d @ \
+            "${COCO_AS}" attestation.AttestationService/AttestationEvaluate <"$req_file" 2>&1) \
+            && break
+        warn "grpcurl attempt ${attempt}/${max_attempts} failed; retrying (AMD KDS may be transiently unavailable):"
+        echo "$response" | tail -2 >&2
+        sleep 5
+    done
+    if ! printf '%s' "$response" | grep -q '"attestationToken"'; then
         rm -f "$req_file"
         echo "" >&2
         error "=== CoCo-AS logs (journalctl -u grpc-as.service -n 30) ==="
         journalctl -u grpc-as.service -n 30 --no-pager >&2 2>/dev/null || true
-        die "Attestation request failed."
+        die "Attestation request failed after ${attempt} attempt(s)."
     fi
     rm -f "$req_file"
 
@@ -199,9 +208,16 @@ snp_ear_fields() {
     # (chip_id, measurement, reported_tcb_*), NOT nested under a 'report'
     # key, and there is NO 'tcb_status' field — AMD KDS verification is
     # signalled by ear.trustworthiness-vector.hardware (0..100).
+    # Output is '|' delimited (not whitespace): empty fields are preserved and
+    # values may contain spaces (e.g. the TCB status text), so `read` cannot
+    # shift the columns.
     local jwt_json="$1"
+    [[ -n "$jwt_json" ]] || return 0
     if command -v python3 >/dev/null 2>&1; then
-        python3 -c "
+        # Pipe (not a here-string) with `|| true` keeps this immune to the ERR
+        # trap / set -e even if python exits non-zero (its try/except already
+        # swallows errors); the output is the pipe-delimited field list.
+        printf '%s' "$jwt_json" | python3 -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
@@ -209,79 +225,78 @@ try:
     ear_status = submod.get('ear.status', '')
     evidence = submod.get('ear.veraison.annotated-evidence', {})
     snp = evidence.get('snp', {})
-    # fields are flat under 'snp' (no 'report' wrapper) in this version
     chip_id = snp.get('chip_id', '')
-    measurement = snp.get('measurement', '')
-    reported_tcb = ' '.join('%s=%s' % (k, v)
-                            for k, v in snp.items()
-                            if k.startswith('reported_tcb_'))
-    # KDS verification signal: hardware trustworthiness from the EAR.
     tw = submod.get('ear.trustworthiness-vector', {})
     hardware_tw = tw.get('hardware', '')
-    # Derive a human TCB status: if the EAR was issued and hardware was
-    # verified via the AMD KDS certificate chain, the report is authentic.
     if str(hardware_tw) not in ('', 'None') and int(hardware_tw) >= 50:
         tcb_status = 'Verified (hardware trustworthiness %s%%)' % hardware_tw
     else:
-        # Not KDS-verified: leave empty so the success logic does not treat a
-        # rejected report as a hardware attestation success.
         tcb_status = ''
-    # '|' delimited (not whitespace): empty fields are preserved and values
-    # may contain spaces (e.g. the TCB status text), so `read` cannot shift
-    # the columns.
     print('|'.join([ear_status, '', '', '', '', '', '', '', chip_id, tcb_status]))
 except Exception:
     pass
-" <<<"$jwt_json" 2>/dev/null
+" || true
     fi
+    return 0
 }
 
+# Build the CoCo-AS SNP reference-value sample: a JSON map of reference-value
+# id -> value that ear_default_policy_cpu.rego looks up during appraisal.
+# The `in` fields (snp_launch_measurement, snp_bootloader, snp_microcode,
+# snp_snp_svn, snp_tee_svn) must be JSON lists; the `==` fields (snp_smt_enabled,
+# snp_tsme_enabled, snp_guest_abi_major/minor, snp_single_socket, snp_smt_allowed)
+# must be raw scalars with the same JSON type as the report so Rego matching
+# succeeds. Values come from the guest report's annotated evidence, so the
+# appraisal recognises this exact guest. stdin: decoded EAR JWT; stdout: sample.
+snp_rv_sample() {
+    require_cmd python3
+    # `|| true` keeps this immune to the ERR trap / set -e even if python
+    # exits non-zero (its try/except already swallows errors).
+    python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    snp = d['submods']['cpu0']['ear.veraison.annotated-evidence']['snp']
+    rv = {
+        'snp_launch_measurement': [snp['measurement']],
+        'snp_bootloader': [snp['reported_tcb_bootloader']],
+        'snp_microcode': [snp['reported_tcb_microcode']],
+        'snp_snp_svn': [snp['reported_tcb_snp']],
+        'snp_tee_svn': [snp['reported_tcb_tee']],
+        'snp_smt_enabled': snp['platform_smt_enabled'],
+        'snp_tsme_enabled': snp['platform_tsme_enabled'],
+        'snp_guest_abi_major': snp['policy_abi_major'],
+        'snp_guest_abi_minor': snp['policy_abi_minor'],
+        'snp_single_socket': snp['policy_single_socket'],
+        'snp_smt_allowed': snp['policy_smt_allowed'],
+    }
+    print(json.dumps(rv))
+except Exception:
+    pass
+" || true
+    return 0
+}
+
+# Register a SNP reference-value sample (JSON map) in RVPS so the default EAR
+# appraisal recognises the guest and returns ear.status = affirming.
+# Argument: the sample JSON (see snp_rv_sample).
 register_rvps_reference_values() {
-    local id_block="$1" id_auth="$2" launch_digest="$3"
+    local sample_json="$1"
+    [[ -n "$sample_json" ]] || die "register_rvps_reference_values requires the reference-value sample JSON"
     ensure_attestation_proto
-
-    local sample_dict_json=""
-    if command -v python3 >/dev/null 2>&1; then
-        sample_dict_json=$(python3 -c "
-import json
-print(json.dumps({
-    'id_block': ['$id_block'],
-    'id_auth': ['$id_auth'],
-    'launch_digest': ['$launch_digest']
-}))
-")
-    else
-        sample_dict_json="{\"id_block\":[\"${id_block}\"],\"id_auth\":[\"${id_auth}\"],\"launch_digest\":[\"${launch_digest}\"]}"
-    fi
-
-    local prov_b64=""
-    prov_b64=$(echo -n "$sample_dict_json" | base64 | tr -d '\r\n')
 
     local req_file
     req_file=$(mktemp /tmp/snp-rvps-req.XXXXXX)
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "
-import json
-msg = {
-    'version': '0.1.0',
-    'type': 'sample',
-    'payload': '$prov_b64'
-}
+    printf '%s' "$sample_json" | python3 -c "
+import sys, json, base64
+sample = json.loads(sys.stdin.read())
+prov = base64.b64encode(json.dumps(sample).encode()).decode()
+msg = {'version': '0.1.0', 'type': 'sample', 'payload': prov}
 print(json.dumps({'message': json.dumps(msg)}))
 " >"$req_file"
-    else
-        local msg_inner="{\"version\":\"0.1.0\",\"type\":\"sample\",\"payload\":\"${prov_b64}\"}"
-        local escaped_msg
-        escaped_msg=$(echo -n "$msg_inner" | sed 's/"/\\"/g')
-        cat >"$req_file" <<EOF
-{"message":"${escaped_msg}"}
-EOF
-    fi
 
-    log "Registering reference values in RVPS (${COCO_AS}):"
-    log "  id_block:       $id_block"
-    log "  id_auth:        $id_auth"
-    log "  launch_digest:  $launch_digest"
+    log "Registering SNP reference values in RVPS (${COCO_AS}):"
+    echo "$sample_json" | python3 -m json.tool 2>/dev/null | sed 's/^/  /'
 
     local resp=""
     if ! resp=$(grpcurl -plaintext \
@@ -327,44 +342,25 @@ cmd_register_rv() {
     detect_guest_ip
     log "=== Registering SEV-SNP Reference Values in RVPS: ${GUEST_IP} -> ${COCO_AS} ==="
     step "Fetch guest report and enroll identity into RVPS" \
-        "Fetches a fresh report, decodes SNP identity (id_block, id_auth, launch_digest), and registers them into RVPS so EAR appraisal passes."
+        "Fetches a fresh report, derives the SNP reference values from the report's annotated evidence, and registers them in RVPS so the default EAR appraisal returns affirming."
 
     attest_get_ear_token
     local token="$EAR_TOKEN"
     local jwt_json=""
     jwt_json=$(jwt_decode_payload "$token") || jwt_json=""
+    [[ -n "$jwt_json" ]] || die "Could not obtain an EAR token to derive reference values"
 
-    local id_block="" id_auth="" launch_digest=""
-    local fields
-    fields=$(snp_ear_fields "$jwt_json")
-    if [[ -n "$fields" ]]; then
-        IFS='|' read -r _ id_block id_auth launch_digest _ <<<"$fields"
-    fi
-    if [[ -z "$id_block" ]]; then
-        id_block=$(echo "$jwt_json" | grep -oP '"id_block"\s*:\s*"\K[^"]+' | head -n1 || true)
-    fi
-    if [[ -z "$id_auth" ]]; then
-        id_auth=$(echo "$jwt_json" | grep -oP '"id_auth"\s*:\s*"\K[^"]+' | head -n1 || true)
-    fi
-    if [[ -z "$launch_digest" ]]; then
-        launch_digest=$(echo "$jwt_json" | grep -oP '"launch_digest"\s*:\s*"\K[^"]+' | head -n1 || true)
-    fi
+    local sample_json=""
+    sample_json=$(printf '%s' "$jwt_json" | snp_rv_sample)
+    [[ -n "$sample_json" ]] || die "Could not derive SNP reference values from the report (is this a valid Genoa/Boremi SNP report?)"
 
-    if [[ -z "$id_block" && -z "$id_auth" && -z "$launch_digest" ]]; then
-        die "Could not extract SNP identity from guest report"
-    fi
-
-    if ! register_rvps_reference_values "${id_block:-none}" "${id_auth:-none}" "${launch_digest:-none}"; then
+    if ! register_rvps_reference_values "$sample_json"; then
         die "Failed to register reference values in RVPS"
     fi
 
     echo ""
     log "============================================================================="
     log "           RVPS REFERENCE VALUES SUCCESSFULLY ENROLLED (SEV-SNP)"
-    log "============================================================================="
-    log "  id_block:       ${id_block:-n/a}"
-    log "  id_auth:        ${id_auth:-n/a}"
-    log "  launch_digest:  ${launch_digest:-n/a}"
     log "============================================================================="
     log "Now re-run 'snp-attest.sh attest --guest-ip ${GUEST_IP}' to verify ear.status = affirming."
 }
@@ -428,7 +424,9 @@ cmd_attest() {
 
     if ((REGISTER_RV)); then
         log "Registering guest reference values in RVPS (--register-rv specified)..."
-        if register_rvps_reference_values "${id_block:-none}" "${id_auth:-none}" "${launch_digest:-none}"; then
+        local sample_json=""
+        sample_json=$(printf '%s' "$jwt_json" | snp_rv_sample)
+        if [[ -n "$sample_json" ]] && register_rvps_reference_values "$sample_json"; then
             # Re-evaluate the SAME report that was just registered (not a fresh
             # one), so the EAR token reflects the just-enrolled identity.
             log "Re-evaluating the same registered report to obtain updated EAR token..."
