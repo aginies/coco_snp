@@ -139,6 +139,23 @@ cmd_setup_host() {
         warn "/dev/sev missing. Load kvm_amd with SNP enabled and check BIOS SEV-SNP:"
         warn "  dmesg | grep -i sev"
     fi
+    # snphost's platform probe reads CPU MSRs (current TCB, chip ID, CBB
+    # registers) via /dev/msr64. The msr kernel module must be present or
+    # those reads fail and 'snphost ok' reports a problem. Probe it here so a
+    # bare host (module not autoloaded) still works.
+    log "Probing msr kernel module (needed by snphost to read CPU MSRs)"
+    if command -v modprobe >/dev/null 2>&1; then
+        if modprobe msr 2>/dev/null; then
+            log "msr module loaded"
+        elif grep -q '^msr[[:space:]]' /proc/modules 2>/dev/null; then
+            log "msr module already loaded"
+        else
+            warn "Could not load the msr module; snphost MSR reads may fail"
+        fi
+    else
+        warn "modprobe not found; cannot probe the msr module"
+    fi
+
     if command -v snphost >/dev/null 2>&1; then
         if snphost ok >/dev/null 2>&1; then
             log "snphost ok: platform probe passed"

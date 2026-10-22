@@ -12,30 +12,52 @@
 # report can be re-evaluated (e.g. right after RVPS registration) without
 # generating a fresh one.
 #
-# Evidence format: the CoCo-AS snp_verifier expects the RAW 4000-byte SEV-SNP
-# report as the evidence bytes (unlike TDX, which wraps a base64 quote in a
-# JSON object). grpcurl's JSON representation of the proto `bytes` field is
-# base64, so the evidence field is simply the base64 of the raw report.
+# Evidence format: the CoCo-AS snp_verifier does NOT take the raw report
+# bytes. The gRPC handler base64-URL-decodes the proto `evidence` field and
+# then runs serde_json::from_slice::<serde_json::Value>(), which must
+# deserialize into verifier::snp::SnpEvidence { attestation_report,
+# cert_chain } — i.e. the JSON serialisation of the parsed AttestationReport
+# (serde field names; [u8;N] -> JSON arrays; TcbVersion/Version -> objects).
+# Sending the raw binary instead is not valid base64url and yields
+# "Illegal input Evidence: Invalid symbol ...". snp_evidence_from_b64() performs
+# that wrap: base64(raw report) -> JSON evidence -> base64url (no padding).
 #
 # Optional second argument: structured runtime data JSON (e.g.
 # '{"tee-pubkey":"..."}'). When given, it is sent as runtime_data so the EAR
 # token carries the matching attester_runtime_data claims (KBS needs the
 # tee-pubkey claim to release resources); the report's report_data must then
 # equal sha384(canonical JSON) zero-padded to 64 bytes.
+# Wrap a base64 (standard) SEV-SNP attestation report as the base64 URL-safe
+# NO-PAD JSON evidence that CoCo-AS's snp_verifier expects. The gRPC handler
+# base64-decodes the proto `evidence` field and serde_json-parses it into
+# SnpEvidence{ attestation_report } — the JSON serialisation of the parsed
+# report — so we must serialise the parsed report, never ship the raw bytes
+# (that yields "Illegal input Evidence: Invalid symbol ...").
+# stdin/stdout: base64 report in, base64url evidence out.
+snp_evidence_from_b64() {
+    local report_b64="$1"
+    require_cmd python3 base64
+    [[ -f "${SCRIPT_DIR}/tools/snp-evidence.py" ]] \
+        || die "missing tools/snp-evidence.py"
+    printf '%s' "$report_b64" \
+        | python3 "${SCRIPT_DIR}/tools/snp-evidence.py"
+}
+
 attest_evaluate_report() {
     local report_b64="$1"
     local runtime_data_json="${2:-}"
-    require_cmd base64
+    require_cmd base64 python3
     ensure_grpcurl || die "grpcurl is required for attestation (see the hint above)."
     ensure_attestation_proto
 
     [[ -n "$report_b64" ]] || die "Empty report passed to attest_evaluate_report"
 
     log "Building attestation request JSON (Trustee 0.20 format, SNP)"
-    # CoCo-AS SNP verifier expects the raw 4000-byte report as evidence bytes.
-    # The proto `bytes` field is base64-encoded in JSON, so evidence = the
-    # base64 of the raw report (no JSON wrapper, unlike TDX).
-    local evidence_b64="$report_b64"
+    # evidence must be the base64url (no-pad) JSON of the parsed report, not
+    # the raw report bytes (see the note above this function).
+    local evidence_b64
+    evidence_b64=$(snp_evidence_from_b64 "$report_b64")
+    [[ -n "$evidence_b64" ]] || die "Failed to build SNP evidence JSON (is python3 installed?)"
 
     local runtime_data_block=""
     if [[ -n "$runtime_data_json" ]]; then
@@ -171,6 +193,12 @@ jwt_decode_payload() {
 # space-separated: ear_status id_block id_auth launch_digest policy vmpl
 # report_id report_id_ma chip_id tcb_status
 snp_ear_fields() {
+    # Reads the flat SNP annotated-evidence structure produced by the Trustee
+    # 0.22.0 snp_verifier: the fields live directly under
+    #   submods.cpu0.ear.veraison.annotated-evidence.snp
+    # (chip_id, measurement, reported_tcb_*), NOT nested under a 'report'
+    # key, and there is NO 'tcb_status' field — AMD KDS verification is
+    # signalled by ear.trustworthiness-vector.hardware (0..100).
     local jwt_json="$1"
     if command -v python3 >/dev/null 2>&1; then
         python3 -c "
@@ -181,17 +209,27 @@ try:
     ear_status = submod.get('ear.status', '')
     evidence = submod.get('ear.veraison.annotated-evidence', {})
     snp = evidence.get('snp', {})
-    report = snp.get('report', {})
-    id_block = report.get('id_block', '')
-    id_auth = report.get('id_auth', '')
-    launch_digest = report.get('launch_digest', '')
-    policy = report.get('policy', '')
-    vmpl = report.get('vmpl', '')
-    report_id = report.get('report_id', '')
-    report_id_ma = report.get('report_id_ma', '')
-    chip_id = report.get('chip_id', '')
-    tcb_status = snp.get('tcb_status', '')
-    print(f'{ear_status} {id_block} {id_auth} {launch_digest} {policy} {vmpl} {report_id} {report_id_ma} {chip_id} {tcb_status}')
+    # fields are flat under 'snp' (no 'report' wrapper) in this version
+    chip_id = snp.get('chip_id', '')
+    measurement = snp.get('measurement', '')
+    reported_tcb = ' '.join('%s=%s' % (k, v)
+                            for k, v in snp.items()
+                            if k.startswith('reported_tcb_'))
+    # KDS verification signal: hardware trustworthiness from the EAR.
+    tw = submod.get('ear.trustworthiness-vector', {})
+    hardware_tw = tw.get('hardware', '')
+    # Derive a human TCB status: if the EAR was issued and hardware was
+    # verified via the AMD KDS certificate chain, the report is authentic.
+    if str(hardware_tw) not in ('', 'None') and int(hardware_tw) >= 50:
+        tcb_status = 'Verified (hardware trustworthiness %s%%)' % hardware_tw
+    else:
+        # Not KDS-verified: leave empty so the success logic does not treat a
+        # rejected report as a hardware attestation success.
+        tcb_status = ''
+    # '|' delimited (not whitespace): empty fields are preserved and values
+    # may contain spaces (e.g. the TCB status text), so `read` cannot shift
+    # the columns.
+    print('|'.join([ear_status, '', '', '', '', '', '', '', chip_id, tcb_status]))
 except Exception:
     pass
 " <<<"$jwt_json" 2>/dev/null
@@ -300,7 +338,7 @@ cmd_register_rv() {
     local fields
     fields=$(snp_ear_fields "$jwt_json")
     if [[ -n "$fields" ]]; then
-        read -r _ id_block id_auth launch_digest _ <<<"$fields"
+        IFS='|' read -r _ id_block id_auth launch_digest _ <<<"$fields"
     fi
     if [[ -z "$id_block" ]]; then
         id_block=$(echo "$jwt_json" | grep -oP '"id_block"\s*:\s*"\K[^"]+' | head -n1 || true)
@@ -358,7 +396,7 @@ cmd_attest() {
     local fields
     fields=$(snp_ear_fields "$jwt_json")
     if [[ -n "$fields" ]]; then
-        read -r ear_status id_block id_auth launch_digest policy vmpl report_id _ chip_id tcb_status <<<"$fields"
+        IFS='|' read -r ear_status id_block id_auth launch_digest policy vmpl report_id _ chip_id tcb_status <<<"$fields"
     fi
     if [[ -z "$ear_status" ]]; then
         ear_status=$(echo "$jwt_json" | grep -oP '"ear\.status"\s*:\s*"\K[^"]+' | head -n1 || true)
