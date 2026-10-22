@@ -690,10 +690,16 @@ enrolled.
 sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv
 ```
 
-> **Default:** `--register-rv` is recommended — it enrolls the guest's launch
-> identity in RVPS *and* re-evaluates the same report, giving a clean
-> `ear.status = affirming` in one step. See [below](#enrolling-reference-values-into-rvps)
+> **Default:** `--register-rv` is recommended on a **fresh** setup — it enrolls
+> the guest's launch identity in RVPS *and* re-evaluates the same report, giving
+> a clean `ear.status = affirming` in one step. See [below](#enrolling-reference-values-into-rvps)
 > for details.
+> > **Once enrolled, it stays enrolled.** Reference values persist in RVPS
+> > (`/var/lib/attestation-service/storage/reference_value/`), so after the
+> > first registration a **plain `attest` (no `--register-rv`) already returns
+> > `affirming`**. You only need `--register-rv` again if you change the guest's
+> > launch identity (different OVMF/kernel → different measurement) or if RVPS
+> > was emptied.
 
 **What it does, in order:**
 
@@ -728,6 +734,11 @@ sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv
      into RVPS and then re-runs appraisal on the *same* report (not a fresh
      one), so the reference values match by construction →
      `ear.status = affirming`.
+   - *Why you often don't need it:* RVPS stores reference values **persistently**,
+     so once they've been enrolled (by any prior `register-rv` / `attest
+     --register-rv`) a plain `attest` returns `affirming` on its own. `--register-rv`
+     is only required to **initially populate** RVPS, or to refresh the values
+     after the guest's launch identity changes.
 
 4. **Submits it to CoCo-AS** with:
 
@@ -1131,7 +1142,7 @@ was verified" — that's why the script can use it as a bearer token in Step 8.
 | `modprobe sev-guest` → "No such device" inside guest | VM not launched as an SNP guest | `sudo ./snp-attest.sh verify` → VM rows; check `launchSecurity type='sev-snp'` in `virsh dumpxml` |
 | Installer never appears; guest boots but isn't confidential | `launchSecurity` missing or firmware not SNP | `virsh dumpxml` — confirm `launchSecurity type='sev-snp'` + `<policy>`; confirm the SNP OVMF descriptor exists |
 | `snpguest report`: "Failed to get the report" | `/dev/sev-guest` not present or GHCB not set up | Confirm the VM is a real SNP guest (Step 6 item 3); check the guest kernel has the `sev-guest` driver |
-| Attestation: `ear.status: contraindicated` | RVPS values missing or mismatched | Run `sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv` or check `journalctl -u grpc-as.service -n 50` |
+| Attestation: `ear.status: contraindicated` | RVPS values missing (fresh RVPS) or mismatched | Run `sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv` to enroll the current identity, or check `journalctl -u grpc-as.service -n 50`. Note: once values are enrolled they **persist** in RVPS, so a plain `attest` already returns `affirming` — `contraindicated` means the store is empty or the guest's launch identity changed. |
 | Attestation: `ear.status: warning` (TCB OutOfDate) | Reported TCB older than KDS's current TCB | Update guest microcode/BIOS, or refresh the KDS cache / offline store |
 | CoCo-AS: "unknown TEE" / verifier error | CoCo-AS not using `snp_verifier` | `sudo ./snp-attest.sh setup-trustee` (rewrites `grpc-as.json` with `snp_verifier`); or `verify` → CoCo-AS rows |
 | KBS rejects tokens: `neither trusted jwk set nor trusted pem public key works` | Token header embeds a `jwk` but the `x5c` chain is empty or doesn't chain to `trusted_certs_paths` | `sudo ./snp-attest.sh setup-trustee` (regenerates `/etc/trustee/as-signer.crt`, `grpc-as.json` `cert_path`, `kbs.json` `trusted_certs_paths`); or `verify` → JWKS rows |
