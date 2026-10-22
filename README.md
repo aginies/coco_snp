@@ -252,6 +252,7 @@ strictly required.
 | SNP OVMF firmware | scan `/usr/share/qemu/firmware/*.json` | A SNP-capable UEFI firmware (feature `amd-sev-snp`) must exist to boot the confidential VM. |
 | `/dev/sev` | `stat /dev/sev` | The SEV-SNP host device. Absent → `kvm_amd` not loaded with SNP, or BIOS off. |
 | snphost package | `rpm -qa` | The host-side SNP verifier (reads the ARK/ASK/VCEK chain). |
+| `msr` kernel module | `lsmod | grep msr` | `snphost` reads per-CPU MSRs via `/dev/msr64`; the module must be loadable or snphost collateral operations fail. Warn if absent. |
 | Trustee services | `systemctl` ×3 | Attestation stack (grpc-as, kbs, rvps; Step 3). |
 | Ports 3000/8080 | `ss -tln` | CoCo-AS and KBS must listen. |
 | KDS reachability | `curl -sI` | AMD KDS is where the ARK/ASK/VCEK chain comes from (or the local store in offline mode). |
@@ -700,19 +701,33 @@ sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv
    - *Why fresh:* the report's `report_data` is a per-run nonce; a reused
      report is rejected.
 
-2. **Fetches the report** (the raw 4000 bytes, base64-encoded over SSH).
-   - *Why base64:* it's binary data that must travel inside a JSON request.
-   - *Why raw (no JSON wrapper):* the CoCo-AS SNP verifier expects the raw
-     report as the `evidence` bytes — unlike TDX, which wraps the quote in a
-     JSON object.
+2. **Fetches the report** (the raw 4000 bytes) and **wraps it as CoCo-AS
+   evidence**. The raw bytes are base64-encoded, embedded in the CoCo-AS
+   `SnpEvidence` JSON structure (`{ "attestation_report": "<base64>" }`), and
+   the whole object is then base64url-encoded into the `evidence` field.
+   - *Why the JSON wrapper:* the CoCo-AS `snp_verifier` base64-URL-decodes the
+     `evidence` field and then `serde_json`-parses the result into
+     `SnpEvidence { attestation_report }` — so the report must be serialised
+     to JSON *first*. Shipping the raw binary (which is not valid base64url)
+     fails with `Illegal input Evidence: Invalid symbol …`. The wrapping is
+     done by `tools/snp-evidence.py`, which parses the firmware report layout
+     (V2/V3/V5) and emits the serde-compatible structure.
+   - *Why base64 at all:* `evidence` is a string field, so the binary report
+     must be encoded to travel inside the JSON request.
 
-3. **Enrolls reference values in RVPS** (with `--register-rv`):
-   - *Why:* RVPS stores the expected launch identity (`id_block`, `id_auth`,
-     `launch_digest`) that CoCo-AS compares against during appraisal. Without
-     enrollment, the appraisal returns `contraindicated` because no reference
-     values exist. `--register-rv` writes the current guest's identity into
-     RVPS and re-evaluates the *same* report (not a fresh one), so the values
-     match by construction → `ear.status = affirming`.
+3. **Enrolls reference values in RVPS** (with `--register-rv`). The
+   reference-value sample is **derived from the same report** just generated,
+   not hard-coded: the toolkit reads the report's annotated evidence and builds
+   the CoCo-AS reference-value structure directly — JSON *lists* for the `in`
+   fields (`snp_launch_measurement`, `snp_bootloader`, `snp_microcode`,
+   `snp_snp_svn`, `snp_tee_svn`) and raw scalars of the matching JSON type for
+   the `==` fields (`snp_smt`/`tsme_enabled`, `snp_guest_abi_major/minor`,
+   `snp_single_socket`, `snp_smt_allowed`). This type-accurate sample is what
+   lets the Rego policy match and reach `affirming`.
+   - *Why re-evaluate the same report:* `--register-rv` writes those values
+     into RVPS and then re-runs appraisal on the *same* report (not a fresh
+     one), so the reference values match by construction →
+     `ear.status = affirming`.
 
 4. **Submits it to CoCo-AS** with:
 
@@ -726,7 +741,7 @@ sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv
    ```json
    {
      "verification_requests": [
-       { "tee": "snp", "evidence": "<base64 of the 4000-byte report>" }
+       { "tee": "snp", "evidence": "<base64url of the SnpEvidence JSON wrapper>" }
      ],
      "policy_ids": ["default"]
    }
@@ -757,7 +772,12 @@ tokens" at the end of this guide.)*
 
 The `attest` command decodes the EAR token (a JWT built on EAT, RFC 9711):
 extracts the payload, formats the claims, displays a structured verification
-report, and checks `ear.status` as well as the KDS `tcb_status`.
+report, and checks `ear.status` together with the AMD KDS hardware
+trustworthiness vector (`ear.trustworthiness-vector.hardware`, 0–100 — this
+build of the annotated evidence has no `submods.cpu0.tcb_status`, so KDS
+verification is read from there). The grpcurl appraisal call is retried
+(up to 4× with a 5 s backoff) to ride out transient AMD KDS VCEK-fetch
+failures, which are common on the back-to-back re-evaluation.
 
 **Expected output (report verified, awaiting RVPS enrollment):**
 
@@ -792,10 +812,12 @@ AMD KDS hardware verification AND Trustee appraisal passed!
 
 ### Enrolling reference values into RVPS
 
-The default Trustee appraisal policy used by this script requires `id_block`,
-`id_auth`, and `launch_digest` to match approved reference values stored in
-the Reference Value Provider Service (RVPS). You can enroll the guest's
-identity directly:
+The default Trustee appraisal policy used by this script requires the report's
+launch-measurement / TCB claims to match approved reference values stored in
+the Reference Value Provider Service (RVPS). Unlike a simple launch-digest
+match, this Trustee version's annotated evidence carries a set of `in` (list)
+and `==` (scalar) fields, so the reference values are **derived from the
+report itself** rather than a single value. You can trigger this directly:
 
 ```bash
 # Enroll reference values and attest in one step:
