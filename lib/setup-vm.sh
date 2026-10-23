@@ -626,8 +626,27 @@ Reinstall qemu with SNP target (package: $(distro_pkgs qemu))."
                 | grep -vE '\bunknown\b' \
                 | grep -qE '/dev/.*(partition|filesystem)'; then
             disk_has_os=1
+            log "Disk contains a filesystem; reusing it."
         else
-            warn "Disk contains no filesystem (leftover from an aborted install?) — treating as fresh."
+            log "Disk is empty (no partition table / filesystem) — leftover from an aborted install."
+            # Decide whether to remove it so setup-vm creates a fresh disk. This
+            # avoids a possibly dirty leftover partition table confusing the
+            # installer and guarantees a clean install:
+            #   - interactive (tty): prompt y/N
+            #   - --force: auto-remove
+            #   - non-interactive without --force: keep (installer reuses it)
+            local remove_empty=0
+            if [[ -t 0 ]]; then
+                confirm "Remove the empty disk and start fresh? [y/N] " && remove_empty=1
+            elif ((FORCE)); then
+                remove_empty=1
+            fi
+            if ((remove_empty)); then
+                log "Removing empty disk: ${VM_DISK_PATH}"
+                rm -f "$VM_DISK_PATH"
+            else
+                warn "Keeping the empty disk; the installer will write to it during install."
+            fi
         fi
     fi
 
@@ -705,7 +724,9 @@ Reinstall qemu with SNP target (package: $(distro_pkgs qemu))."
     else
         log "Creating qcow2 disk: ${VM_DISK_PATH} (${VM_DISK})"
         mkdir -p "$(dirname "$VM_DISK_PATH")"
-        if ((disk_has_os)); then
+        # Reuse an existing disk (has an OS, or an empty one the user kept);
+        # only create a fresh one when nothing is there yet.
+        if ((disk_has_os)) || [[ -f "$VM_DISK_PATH" ]]; then
             :
         else
             run qemu-img create -f qcow2 "$VM_DISK_PATH" "$VM_DISK"
