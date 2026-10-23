@@ -473,6 +473,12 @@ sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso
      counted as "has an OS" when it actually contains a filesystem
      (`virt-filesystems`); a leftover empty qcow2 from an aborted install is
      treated as fresh.
+   - *Leftover empty disk:* if a reused disk has **no** OS, setup-vm says so
+     and **offers to remove it** so a fresh disk is created for a clean
+     install — interactive `y/N` prompt, automatic with `--force`, and kept
+     (the installer just writes to it) when run non-interactively without
+     `--force`. This avoids a dirty leftover partition table confusing the
+     installer and prevents `virt-customize` from failing on an empty disk.
 
 3. **Creates the domain definition.** Two engines, same result:
 
@@ -1141,6 +1147,7 @@ was verified" — that's why the script can use it as a bearer token in Step 8.
 | `/dev/sev` missing | `kvm_amd` not loaded with SNP support | `modprobe kvm_amd`; check `dmesg \| grep -i sev` for SEV-SNP init |
 | `modprobe sev-guest` → "No such device" inside guest | VM not launched as an SNP guest | `sudo ./snp-attest.sh verify` → VM rows; check `launchSecurity type='sev-snp'` in `virsh dumpxml` |
 | Installer never appears; guest boots but isn't confidential | `launchSecurity` missing or firmware not SNP | `virsh dumpxml` — confirm `launchSecurity type='sev-snp'` + `<policy>`; confirm the SNP OVMF descriptor exists |
+| `setup-vm`: `virt-customize: no operating systems were found in the guest image` | Reusing a leftover **empty** disk (no OS, from an aborted install) — it has no partition table/filesystem | setup-vm now detects this and offers to remove the empty disk for a clean install (or keep it; the installer writes to it). To do it manually: run `./snp-attest.sh clean` first to destroy the old VM + disk, then re-run `setup-vm` |
 | `snpguest report`: "Failed to get the report" | `/dev/sev-guest` not present or GHCB not set up | Confirm the VM is a real SNP guest (Step 6 item 3); check the guest kernel has the `sev-guest` driver |
 | Attestation: `ear.status: contraindicated` | RVPS values missing (fresh RVPS) or mismatched | Run `sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv` to enroll the current identity, or check `journalctl -u grpc-as.service -n 50`. Note: once values are enrolled they **persist** in RVPS, so a plain `attest` already returns `affirming` — `contraindicated` means the store is empty or the guest's launch identity changed. |
 | Attestation: `ear.status: warning` (TCB OutOfDate) | Reported TCB older than KDS's current TCB | Update guest microcode/BIOS, or refresh the KDS cache / offline store |
