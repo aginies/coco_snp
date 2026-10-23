@@ -614,8 +614,17 @@ Reinstall qemu with SNP target (package: $(distro_pkgs qemu))."
         # NB: virt-filesystems has --all and --long; there is no --long-only.
         # Passing an unknown flag makes it exit non-zero, which silently
         # demoted every reused disk to "fresh" and skipped SSH key injection.
+        #
+        # A reused disk counts as "has an OS" only if it has real partitions
+        # OR a filesystem with a recognised VFS. An empty qcow2 (no partition
+        # table) is reported by virt-filesystems as a single
+        # "/dev/sda filesystem unknown" row, which must be excluded — otherwise
+        # we'd try to virt-customize an empty disk and fail with
+        # "no operating systems were found in the guest image".
         if command -v virt-filesystems >/dev/null 2>&1 &&
-            virt-filesystems -a "$VM_DISK_PATH" --all --long 2>/dev/null | grep -q .; then
+            virt-filesystems -a "$VM_DISK_PATH" --all --long 2>/dev/null \
+                | grep -vE '\bunknown\b' \
+                | grep -qE '/dev/.*(partition|filesystem)'; then
             disk_has_os=1
         else
             warn "Disk contains no filesystem (leftover from an aborted install?) — treating as fresh."
