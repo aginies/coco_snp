@@ -1,57 +1,107 @@
-# MEMO — SEV-SNP Attestation Toolkit (`snp-attest.sh`)
+# MEMO — AMD SEV-SNP Remote Attestation
 
-**Project:** AMD SEV-SNP remote attestation + secret delivery toolchain (Trustee / CoCo-AS).
-**Repo:** `coco_snp` — `snp-attest.sh` + `lib/*.sh` (distro-pluggable; SLES/openSUSE implemented). Full docs: `README.md`.
-**Host:** `genoa-sev1` (10.128.65.5) — snphost. **Guest:** VM `161` @ 192.168.122.239 (libvirt NAT). Chip: Genoa.
-**Status:** ✅ Attestation works end-to-end; `ear.status = affirming`. Working tree clean on both local repo and snphost.
+**One line:** prove, to a remote party, that a workload is running inside a genuine, untampered AMD SEV-SNP confidential VM — and nothing else.
 
----
-
-## What the toolkit does
-Proves a guest is a genuine, untampered SEV-SNP confidential VM, then releases a secret only to it. The CPU's **PSP** signs a 4000-byte report in-guest with a **VCEK** (over GHCB) — no host quote daemon, no vsock, no per-platform registration. Collateral (ARK→ASK→VCEK) comes from **AMD KDS**. Flow: `snpguest report` → host fetches over SSH → wraps as CoCo-AS evidence → `grpcurl` to CoCo-AS (127.0.0.1:3000) → verifies sig + TCB + RVPS launch identity → signs **EAR token** (JWT/EAT) → KBS gates the secret.
-
-## Commands
-`check` → `setup-host` → `setup-trustee` → `setup-vm --guest-iso …` → (install OS via `virsh console`) → `setup-guest --guest-ip …` → `attest --guest-ip … [--register-rv]` → `secret-set` / `secret-get`. One-shot: `snp-attest.sh all`. Read-only audit: `verify`. Cleanup: `clean`.
+SEV-SNP (Secure Encrypted Virtualization — Secure Nested Paging) makes a VM's memory **encrypted** (isolation from the hypervisor) **and** **integrity-protected** (detection of tampering). Attestation extends that guarantee remotely: the relying party gets cryptographically verified claims about *where*, *how*, and *what* ran, before trusting the guest with a secret or data.
 
 ---
 
-## Bugs fixed & commits (newest first)
+## 1. The trust anchor: the PSP
 
-| Commit | Fix |
+All security operations centre on the **Platform Security Processor (PSP)** — an on-die security coprocessor dedicated to the AMD EPYC (Rome / Genoa / Turin+) CPU.
+
+| Role | Detail |
 | --- | --- |
-| `0d40d7b` Docs | Document empty-reused-disk detection + offer-to-remove (Step 4 + troubleshooting). |
-| `6dea8ce` Code | **Offer to remove** an empty reused disk before install (interactive `y/N`, `--force` auto-remove, keep non-interactively). Fixed a `[[ -t 0 ]] && confirm` bug that blocked `--force` in non-interactive runs. Also guard generated-XML disk creation on file existence (avoids `qemu-img create: File already exists`). |
-| `88a0865` Code | **Detect correctly:** a reused disk is "has OS" only with real partitions or a filesystem with a recognised VFS. An empty qcow2 is reported by `virt-filesystems` as `/dev/sda filesystem unknown`, which the old `grep -q .` matched → misdetected as has-OS. |
-| `891dc60` Docs | Clarify `--register-rv` is only needed to *populate* RVPS; values **persist**, so plain `attest` already returns `affirming`. |
-| `f687bc7` Docs | Reflect evidence-wrapper, reference-value derivation, msr probe, robust eval. |
-| `c3bdb60` Code | **Derive reference values from the report** (was meaningless `"none"`). `snp_rv_sample()` builds the CoCo-AS sample from annotated evidence (`in`→JSON lists, `==`→scalars). Retry grpcurl 4×/5s for transient KDS VCEK failures. `snp_ear_fields` pipe+`|| true`+`return 0` (ERR-trap safe). |
-| `6e71645` Code | **Core fix:** wrap raw report as CoCo-AS JSON `SnpEvidence` (was shipping raw bytes → `Illegal input Evidence: Invalid symbol …`). New `tools/snp-evidence.py`. Reads KDS verification from `ear.trustworthiness-vector.hardware` (no `submods.cpu0.tcb_status`). Probe `msr` module in setup-host. |
-| `10795d2`…`b98c5d3` | Earlier: KDS URL, `snpguest` report gen, RVPS in-process, CLI fixes, SNP XML, licence, boot-param probes. |
+| **PSP** | AMD's on-die security coprocessor; generates and signs SNP reports. |
+| **GHCB** | Guest-Hypervisor Communication Block — a shared memory page the guest uses to talk to the PSP (e.g. the `GET_REPORT` request). |
+| **VCEK** | VM Certificate Key — a per-launch-identity key the PSP uses to sign reports; chained to the ASK. |
+| **VLEK** | VM Launch Encryption Key — encrypts the guest's launch secret (direct launch). |
+| **VMSA** | VM Save Area — the initial CPU/register state of the guest at launch. |
+
+Because the PSP is silicon, the signing key never leaves the CPU and the measurement is bound to hardware — you cannot forge a report in software.
 
 ---
 
-## Key facts / gotchas
-- **Evidence format:** `snp_verifier` base64url-decodes `evidence` then `serde_json`-parses into `SnpEvidence { attestation_report }` → report must be JSON first. `tools/snp-evidence.py` parses the firmware report layout (V2/V3/V5).
-- **`register-rv`:** only needed to *initially populate* RVPS (`/var/lib/attestation-service/storage/reference_value/`). Values persist → plain `attest` returns `affirming`. RVPS has no `Delete` (only Query/Register), so values can't be removed via the toolkit.
-- **Appraisal reads:** `ear.status` + `ear.trustworthiness-vector.hardware` (0–100). This Trustee build's annotated evidence has **no** `id_block`/`id_auth`/`launch_digest`/`submods` — hardware verification is `Unknown`/blank in the printed report but `affirming` still results from the `snp_*` measurement/TCB fields.
-- **Disk reuse:** empty reused qcow2 → skip `virt-customize`; installer writes to it. Offer to remove for a clean install.
-- **`check` probes:** added `msr` module (snphost reads per-CPU MSRs via `/dev/msr64`).
-- **Guest reachability:** guest is behind snphost NAT (192.168.122.239); run `attest`/`setup-vm` *from* snphost, not from the management host.
-- **Lab-only defaults:** allow-all Rego policy, KBS `insecure_http`/`InsecureAllowAll`, host-mode `secret-get` leaves EAR token on host.
+## 2. The attestation report (4000 bytes)
+
+The guest asks the PSP for a report over the GHCB channel. The PSP measures the guest's entire launch state (OVMF → kernel → initrd → VMSA) into a single **launch digest**, and signs the result with the **VCEK**. Key fields:
+
+| Field | Size | Meaning |
+| --- | --- | --- |
+| `launch_digest` | 48 B (384-bit) | The guest's launch state — the SNP equivalent of TDX's MRTD + RTMRs rolled into one. |
+| `id_block` / `id_auth` | 32 B each | Guest family / author identifiers set by the VMM at launch. |
+| `reported_tcb` | — | Firmware / TEE / microcode TCB the guest launched with (checked against KDS). |
+| `policy` | 64 B | Launch policy bits (default `0x30000`). |
+| `vmpl` | — | Privilege level (0 = guest OS, 1–3 = more privileged). |
+| `report_data` | 64 B | Caller-chosen field, bound to a nonce or a TEE public key. |
+| `svn` | — | Security Version Number — monotonically increasing patch level. |
+
+**SNP vs TDX measurement model:** TDX has four extend-only **RTMR** registers (per-stage granularity). SNP extends a *single* running digest as the firmware walks the boot chain — simpler to reason about (one value to enroll) but no per-stage split.
 
 ---
 
-## Verified on host
-- Plain `./snp-attest.sh attest --guest-ip 192.168.122.239` (no `--register-rv`) → **`ear.status = affirming`**, EXIT=0.
-- Detection logic tested: partitioned+ext4 disk → has-OS; empty reused disk → fresh.
-- Both `lib/setup-vm.sh` fixes committed locally (`88a0865`, `6dea8ce`) and synced+committed on snphost (`da61006`).
+## 3. The certificate chain (ARK → ASK → VCEK)
 
-## To reproduce / continue
-```bash
-# on snphost:
-cd /root/coco_snp
-./snp-attest.sh setup-vm --guest-iso /var/lib/libvirt/images/default/<SLE-*.iso>   # boots installer
-virsh console 161                                                                   # install SLES
-./snp-attest.sh setup-guest --guest-ip 192.168.122.239
-./snp-attest.sh attest --guest-ip 192.168.122.239 --register-rv                     # → affirming
+To verify a report's signature, the verifier needs the key that signed it. That chain comes from **AMD KDS (Key Distribution Service)**:
+
 ```
+ARK  (AMD Root Key — trust anchor)
+ └─ ASK  (AMD Signing Key — signed by ARK)
+     └─ VCEK  (per-launch-identity — signed by ASK)  ← signs the report
+```
+
+- **Remote mode:** fetched live from `https://kdsintf.amd.com/vcek/v1`.
+- **Offline mode:** imported once into a local store (`/var/lib/sev-snp/certs/{ark,ask,vcek}.pem`).
+
+Unlike Intel TDX, there is **no per-platform registration** and **no PCK certificate** — the VCEK is derived from the launch measurement itself. This removes an entire setup step and a class of host-side quote bugs.
+
+---
+
+## 4. The remote attestation flow
+
+```
+GUEST                              HOST
+  │  1. snpguest report  ──────────▶ │  PSP signs report with VCEK (in-guest, over GHCB)
+  │     4000-byte report             │
+  │  2. report → host over SSH       │
+  │                                 │  3. Wrap report as CoCo-AS SnpEvidence evidence
+  │                                 │  4. grpcurl → CoCo-AS (127.0.0.1:3000)
+  │                                 │     ├─ verify VCEK signature (ARK→ASK→VCEK)
+  │                                 │     ├─ check reported TCB against KDS
+  │                                 │     ├─ compare launch identity vs RVPS reference values
+  │                                 │     └─ sign an EAR token (JWT)
+  │                                 │  5. KBS reads EAR claims + allow decision
+  │  6. secret released ◀────────────┤  7. KBS releases secret only if allow = true
+```
+
+**Decision = `ear.status`:**
+- **`affirming`** — verified against KDS *and* launch identity matches enrolled reference values. Success.
+- **`warning`** — hardware verified, but a non-critical claim is off (e.g. TCB `OutOfDate`, stale KDS cache).
+- **`contraindicated`** — hardware verified but no / mismatched reference values in RVPS.
+
+---
+
+## 5. EAR tokens & KBS
+
+- **EAR (EAT Attestation Result)** — a JWT built on the IETF **EAT** (RFC 9711). It normalises the binary report into standard JSON, adds the `allow` policy decision, and is portable.
+- KBS verifies the EAR signature with the JWKS (the signer's public key) and reads `allow` **without** re-doing the attestation — portable proof that "this guest was verified".
+- **KBS (Key Broker Service)** stores secrets and releases one only to a client that (1) attests successfully and (2) passes the resource policy (Rego).
+- **RVPS (Reference Value Provider Service)** stores the expected launch identity that CoCo-AS compares against. Reference values are enrolled once (e.g. `register-rv`) and persist; plain attestation returns `affirming` as long as they match.
+
+---
+
+## 6. SEV-SNP vs Intel TDX (attestation data path)
+
+| | SEV-SNP (AMD) | TDX (Intel) |
+| --- | --- | --- |
+| Who signs the quote | Guest's **PSP** (in-guest) | Host-side **QGS** daemon |
+| Channel | GHCB | vsock |
+| Collateral source | AMD **KDS** (ARK/ASK/VCEK) | Intel **PCS** (PCK) |
+| Platform registration | **None** | Required (PCK issuance) |
+| Setup cost | No `setup-qgs`, no quote path | Quote daemon + registration |
+
+---
+
+## 7. Why it matters
+
+Attestation turns "I trust the VM" into "I have cryptographic proof the VM is genuine and untampered." Enabling **remote** attestation adds the relying-party layer: a verifier (or KBS) can gate secrets, data, or compute access on verified hardware + firmware + software claims — the foundation of confidential computing, secure multi-tenant workloads, and zero-trust deployment.
