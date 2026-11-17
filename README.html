@@ -31,7 +31,7 @@
 
 <header class="hero">
   <h1>AMD SEV-SNP Attestation — Step-by-Step Guide</h1>
-  <p>Version 1.0.1</p>
+  <p>Version 1.0.2</p>
 </header>
 
 
@@ -46,9 +46,6 @@
   <li><strong>HOST</strong> — the physical machine running the hypervisor. All commands in this guide run here (guest commands are executed remotely over SSH).</li>
   <li><strong>GUEST</strong> — the virtual machine that becomes an <strong>SEV-SNP confidential VM</strong>: its memory is encrypted <em>and</em> integrity-protected by the AMD SEV-SNP hardware, and its launch state is measured into a single <strong>launch digest</strong> that the CPU's PSP signs into an attestation report.</li>
 </ul>
-<div class="callout info">
-  <p><strong>SEV-SNP vs Intel TDX in one paragraph.</strong> Both are confidential-VM technologies, but the attestation data path is different. In TDX the guest cannot sign its own quote — it asks a <strong>host-side QGS</strong> service to sign a TD Report over vsock, and verification pulls PCK collateral from Intel PCS. In SEV-SNP the <strong>CPU's PSP signs the report in-guest</strong> (over the GHCB channel) with a <strong>VCEK</strong> derived from the launch measurement — there is no host quote daemon, no vsock quote path, and no per-platform registration. Collateral (the ARK → ASK → VCEK chain) comes from <strong>AMD KDS</strong>. That removes an entire setup step (no <code>setup-qgs</code>) and a whole class of host-side quote bugs.</p>
-</div>
 <hr>
 <h2 id="source-code">Source Code</h2>
 <p>The source code for these scripts is hosted on GitHub:</p>
@@ -62,16 +59,16 @@
 cd coco_snp</pre>
 <p>This gives you the full history, all branches, and the ability to update with <code>git pull</code>.</p>
 <p class="caption"><strong>Option 2 — Download a specific release tarball:</strong></p>
-<pre>VERSION="1.0.1"
+<pre>VERSION="1.0.2"
 curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
 tar xzf coco_snp-${VERSION}.tar.gz
 cd coco_snp-${VERSION}</pre>
 <p>The tarball contains a versioned subdirectory with all scripts, the library, and documentation — ready to use without Git.</p>
 <p class="caption"><strong>Option 3 — Download a single branch or tag:</strong></p>
 <pre># Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.1.tar.gz"
-tar xzf v1.0.1.tar.gz
-cd coco_snp-1.0.1</pre>
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.2.tar.gz"
+tar xzf v1.0.2.tar.gz
+cd coco_snp-1.0.2</pre>
 <hr>
 <h2 id="quick-start--11-commands-on-a-ready-host">Quick Start — 11 commands on a ready host</h2>
 <p><strong>Goal in one sentence:</strong> prove to a remote verifier that the guest is a genuine, untampered SEV-SNP confidential VM, and only then hand it a secret.</p>

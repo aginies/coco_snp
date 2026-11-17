@@ -1,6 +1,6 @@
 # AMD SEV-SNP Attestation — Step-by-Step Guide
 
-Version 1.0.1
+Version 1.0.2
 
 A guided walkthrough of how to set up and run AMD SEV-SNP attestation using
 `snp-attest.sh`. The installation layer is distribution-pluggable (`lib/distros/`),
@@ -16,17 +16,6 @@ The whole process has two sides:
   its memory is encrypted *and* integrity-protected by the AMD SEV-SNP
   hardware, and its launch state is measured into a single **launch digest**
   that the CPU's PSP signs into an attestation report.
-
-> **SEV-SNP vs Intel TDX in one paragraph.** Both are confidential-VM
-> technologies, but the attestation data path is different. In TDX the guest
-> cannot sign its own quote — it asks a **host-side QGS** service to sign a
-> TD Report over vsock, and verification pulls PCK collateral from Intel PCS.
-> In SEV-SNP the **CPU's PSP signs the report in-guest** (over the GHCB
-> channel) with a **VCEK** derived from the launch measurement — there is no
-> host quote daemon, no vsock quote path, and no per-platform registration.
-> Collateral (the ARK → ASK → VCEK chain) comes from **AMD KDS**. That
-> removes an entire setup step (no `setup-qgs`) and a whole class of
-> host-side quote bugs.
 
 ---
 
@@ -52,7 +41,7 @@ This gives you the full history, all branches, and the ability to update with
 **Option 2 — Download a specific release tarball:**
 
 ```bash
-VERSION="1.0.1"
+VERSION="1.0.2"
 curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
 tar xzf coco_snp-${VERSION}.tar.gz
 cd coco_snp-${VERSION}
@@ -65,9 +54,9 @@ and documentation — ready to use without Git.
 
 ```bash
 # Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.1.tar.gz"
-tar xzf v1.0.1.tar.gz
-cd coco_snp-1.0.1
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.2.tar.gz"
+tar xzf v1.0.2.tar.gz
+cd coco_snp-1.0.2
 ```
 
 ---
