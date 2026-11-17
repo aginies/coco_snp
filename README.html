@@ -30,7 +30,7 @@
 
 <header class="hero">
   <h1>AMD SEV-SNP Attestation — Step-by-Step Guide</h1>
-  <p>Version 1.0.0</p>
+  <p>Version 1.0.1</p>
 </header>
 
 
@@ -128,16 +128,16 @@ sudo ./snp-attest.sh secret-get --guest-ip &lt;GUEST_IP&gt; --path default/test/
 cd coco_snp</pre>
 <p>This gives you the full history, all branches, and the ability to update with <code>git pull</code>.</p>
 <p class="caption"><strong>Option 2 — Download a specific release tarball:</strong></p>
-<pre>VERSION="1.0.0"
+<pre>VERSION="1.0.1"
 curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
 tar xzf coco_snp-${VERSION}.tar.gz
 cd coco_snp-${VERSION}</pre>
 <p>The tarball contains a versioned subdirectory with all scripts, the library, and documentation — ready to use without Git.</p>
 <p class="caption"><strong>Option 3 — Download a single branch or tag:</strong></p>
 <pre># Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.0.tar.gz"
-tar xzf v1.0.0.tar.gz
-cd coco_snp-1.0.0</pre>
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.1.tar.gz"
+tar xzf v1.0.1.tar.gz
+cd coco_snp-1.0.1</pre>
 <hr>
 <h2 id="prerequisites-before-any-script-command">Prerequisites <span>(before any script command)</span></h2>
 <table>
@@ -156,7 +156,10 @@ cd coco_snp-1.0.0</pre>
 <div class="callout info">
   <strong>No platform registration needed.</strong> Unlike Intel TDX (Xeon 6 / Scalable platforms must be registered before PCK certificates are issued), SEV-SNP needs <strong>no per-platform registration</strong>. The VCEK is derived from the VM's launch measurement and chained to AMD's public ARK/ASK root — fetched from KDS. If <code>check</code> reports the CPU does not advertise SEV-SNP, the fix is a BIOS setting, not a registration.
 </div>
-<p>If BIOS SEV-SNP is off, nothing later will work — the CPU will not report <code>sev_snp</code> and <code>/dev/sev</code> will not support the SNP ioctls.</p>
+<div class="callout warn">
+  <span class="tag">Warning</span>
+  If BIOS SEV-SNP is off, nothing later will work — the CPU will not report <code>sev_snp</code> and <code>/dev/sev</code> will not support the SNP ioctls.
+</div>
 <hr>
 <h2 id="one-shot-setup-snp-attestsh-all">One-shot setup: <code>snp-attest.sh all</code></h2>
 <p>Instead of running Steps 1–4 one by one, a single command chains them:</p>
@@ -364,6 +367,7 @@ ss -tln | grep -E '3000|8080'                  # ports listening</pre>
 </ol>
 <ul>
   <li><em>Why:</em> guest storage. If the disk already exists it's reused — but only counted as "has an OS" when it actually contains a filesystem (<code>virt-filesystems</code>); a leftover empty qcow2 from an aborted install is treated as fresh.</li>
+  <li><em>Leftover empty disk:</em> if a reused disk has <strong>no</strong> OS, setup-vm says so and <strong>offers to remove it</strong> so a fresh disk is created for a clean install — interactive <code>y/N</code> prompt, automatic with <code>--force</code>, and kept (the installer just writes to it) when run non-interactively without <code>--force</code>. This avoids a dirty leftover partition table confusing the installer and prevents <code>virt-customize</code> from failing on an empty disk.</li>
 </ul>
 <ol>
   <li><strong>Creates the domain definition.</strong> Two engines, same result:</li>
@@ -522,7 +526,7 @@ virsh dumpxml snp-guest | grep -E 'launchSecurity|vsock|policy'</pre>
 <p class="caption"><strong>Command (on the host):</strong></p>
 <pre>sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv</pre>
 <div class="callout info">
-  <strong>Default:</strong> <code>--register-rv</code> is recommended — it enrolls the guest's launch identity in RVPS <em>and</em> re-evaluates the same report, giving a clean <code>ear.status = affirming</code> in one step. See <a href="#enrolling-reference-values-into-rvps">below</a> for details.
+  <strong>Default:</strong> <code>--register-rv</code> is recommended on a <strong>fresh</strong> setup — it enrolls the guest's launch identity in RVPS <em>and</em> re-evaluates the same report, giving a clean <code>ear.status = affirming</code> in one step. See <a href="#enrolling-reference-values-into-rvps">below</a> for details. &gt; <strong>Once enrolled, it stays enrolled.</strong> Reference values persist in RVPS &gt; (<code>/var/lib/attestation-service/storage/reference_value/</code>), so after the &gt; first registration a <strong>plain <code>attest</code> (no <code>--register-rv</code>) already returns &gt; <code>affirming</code></strong>. You only need <code>--register-rv</code> again if you change the guest's &gt; launch identity (different OVMF/kernel → different measurement) or if RVPS &gt; was emptied.
 </div>
 <p class="caption"><strong>What it does, in order:</strong></p>
 <ol>
@@ -543,6 +547,7 @@ virsh dumpxml snp-guest | grep -E 'launchSecurity|vsock|policy'</pre>
 </ol>
 <ul>
   <li><em>Why re-evaluate the same report:</em> <code>--register-rv</code> writes those values into RVPS and then re-runs appraisal on the <em>same</em> report (not a fresh one), so the reference values match by construction → <code>ear.status = affirming</code>.</li>
+  <li><em>Why you often don't need it:</em> RVPS stores reference values <strong>persistently</strong>, so once they've been enrolled (by any prior <code>register-rv</code> / <code>attest --register-rv</code>) a plain <code>attest</code> returns <code>affirming</code> on its own. <code>--register-rv</code> is only required to <strong>initially populate</strong> RVPS, or to refresh the values after the guest's launch identity changes.</li>
 </ul>
 <ol>
   <li><strong>Submits it to CoCo-AS</strong> with:</li>
@@ -774,8 +779,9 @@ sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso --collateral off
   <tr><td><code>/dev/sev</code> missing</td><td><code>kvm_amd</code> not loaded with SNP support</td><td><code>modprobe kvm_amd</code>; check <code>dmesg | grep -i sev</code> for SEV-SNP init</td></tr>
   <tr><td><code>modprobe sev-guest</code> → "No such device" inside guest</td><td>VM not launched as an SNP guest</td><td><code>sudo ./snp-attest.sh verify</code> → VM rows; check <code>launchSecurity type='sev-snp'</code> in <code>virsh dumpxml</code></td></tr>
   <tr><td>Installer never appears; guest boots but isn't confidential</td><td><code>launchSecurity</code> missing or firmware not SNP</td><td><code>virsh dumpxml</code> — confirm <code>launchSecurity type='sev-snp'</code> + <code>&lt;policy&gt;</code>; confirm the SNP OVMF descriptor exists</td></tr>
+  <tr><td><code>setup-vm</code>: <code>virt-customize: no operating systems were found in the guest image</code></td><td>Reusing a leftover <strong>empty</strong> disk (no OS, from an aborted install) — it has no partition table/filesystem</td><td>setup-vm now detects this and offers to remove the empty disk for a clean install (or keep it; the installer writes to it). To do it manually: run <code>./snp-attest.sh clean</code> first to destroy the old VM + disk, then re-run <code>setup-vm</code></td></tr>
   <tr><td><code>snpguest report</code>: "Failed to get the report"</td><td><code>/dev/sev-guest</code> not present or GHCB not set up</td><td>Confirm the VM is a real SNP guest (Step 6 item 3); check the guest kernel has the <code>sev-guest</code> driver</td></tr>
-  <tr><td>Attestation: <code>ear.status: contraindicated</code></td><td>RVPS values missing or mismatched</td><td>Run <code>sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv</code> or check <code>journalctl -u grpc-as.service -n 50</code></td></tr>
+  <tr><td>Attestation: <code>ear.status: contraindicated</code></td><td>RVPS values missing (fresh RVPS) or mismatched</td><td>Run <code>sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv</code> to enroll the current identity, or check <code>journalctl -u grpc-as.service -n 50</code>. Note: once values are enrolled they <strong>persist</strong> in RVPS, so a plain <code>attest</code> already returns <code>affirming</code> — <code>contraindicated</code> means the store is empty or the guest's launch identity changed.</td></tr>
   <tr><td>Attestation: <code>ear.status: warning</code> (TCB OutOfDate)</td><td>Reported TCB older than KDS's current TCB</td><td>Update guest microcode/BIOS, or refresh the KDS cache / offline store</td></tr>
   <tr><td>CoCo-AS: "unknown TEE" / verifier error</td><td>CoCo-AS not using <code>snp_verifier</code></td><td><code>sudo ./snp-attest.sh setup-trustee</code> (rewrites <code>grpc-as.json</code> with <code>snp_verifier</code>); or <code>verify</code> → CoCo-AS rows</td></tr>
   <tr><td>KBS rejects tokens: <code>neither trusted jwk set nor trusted pem public key works</code></td><td>Token header embeds a <code>jwk</code> but the <code>x5c</code> chain is empty or doesn't chain to <code>trusted_certs_paths</code></td><td><code>sudo ./snp-attest.sh setup-trustee</code> (regenerates <code>/etc/trustee/as-signer.crt</code>, <code>grpc-as.json</code> <code>cert_path</code>, <code>kbs.json</code> <code>trusted_certs_paths</code>); or <code>verify</code> → JWKS rows</td></tr>
@@ -889,7 +895,7 @@ sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso --collateral off
 sudo ./snp-attest.sh show-c   # copyright &amp; license terms</pre>
 
 
-<footer>Generated dynamically from README.md — Intel TDX attestation on SLES 16.1</footer>
+<footer>Generated dynamically from README.md — AMD SEV-SNP attestation on SLES 16.1</footer>
 
 </main>
 </div>

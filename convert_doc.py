@@ -140,11 +140,11 @@ def convert_md_to_html(md_path, html_path):
                         html_body.append(
                                 f'<div class="callout info">\n  <span class="tag">Two sides to this process</span>\n  {text_html}\n</div>\n'
                         )
-                elif text.startswith("If BIOS TDX is off"):
-                        text_html = parse_inline(text)
-                        html_body.append(
-                                f'<div class="callout warn">\n  <span class="tag">Warning</span>\n  {text_html}\n</div>\n'
-                        )
+                elif text.startswith("If BIOS SEV-SNP is off"):
+                	text_html = parse_inline(text)
+                	html_body.append(
+                		f'<div class="callout warn">\n  <span class="tag">Warning</span>\n  {text_html}\n</div>\n'
+                	)
                 elif text.startswith("⚠️"):
                         text_html = parse_inline(text[1:].strip())
                         html_body.append(
@@ -233,7 +233,7 @@ def convert_md_to_html(md_path, html_path):
                 in_table = False
 
         # Hero and title parsing (at beginning of file)
-        hero_title = "Intel TDX Attestation — Step-by-Step Guide"
+        hero_title = "AMD SEV-SNP Attestation — Step-by-Step Guide"
         hero_desc = ""
         hero_images = []  # (alt, src) tuples found in the intro block
 
@@ -780,7 +780,7 @@ def convert_md_to_html(md_path, html_path):
 
 {body_str}
 
-<footer>Generated dynamically from README.md — Intel TDX attestation on SLES 16.1</footer>
+<footer>Generated dynamically from README.md — AMD SEV-SNP attestation on SLES 16.1</footer>
 
 </main>
 </div>

@@ -1,6 +1,6 @@
 # AMD SEV-SNP Attestation — Step-by-Step Guide
 
-Version 1.0.0
+Version 1.0.1
 
 A guided walkthrough of how to set up and run AMD SEV-SNP attestation using
 `snp-attest.sh`. The installation layer is distribution-pluggable (`lib/distros/`),
@@ -147,7 +147,7 @@ This gives you the full history, all branches, and the ability to update with
 **Option 2 — Download a specific release tarball:**
 
 ```bash
-VERSION="1.0.0"
+VERSION="1.0.1"
 curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
 tar xzf coco_snp-${VERSION}.tar.gz
 cd coco_snp-${VERSION}
@@ -160,9 +160,9 @@ and documentation — ready to use without Git.
 
 ```bash
 # Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.0.tar.gz"
-tar xzf v1.0.0.tar.gz
-cd coco_snp-1.0.0
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.1.tar.gz"
+tar xzf v1.0.1.tar.gz
+cd coco_snp-1.0.1
 ```
 
 ---
