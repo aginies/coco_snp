@@ -84,7 +84,9 @@ def convert_md_to_html(md_path, html_path):
                 if line.startswith("## "):
                         title = line[3:].strip()
                         s_id = slugify(title)
-                        if "Prerequisites" in title:
+                        if "Source Code" in title:
+                                toc_items.append((s_id, "•", "Source Code"))
+                        elif "Prerequisites" in title:
                                 toc_items.append((s_id, "•", "Prerequisites"))
                         elif "Platform Validation" in title:
                                 toc_items.append((s_id, "•", "Platform Validation"))
@@ -168,23 +170,110 @@ def convert_md_to_html(md_path, html_path):
                 nonlocal q_lines
                 if not q_lines:
                         return
-                text = " ".join(q_lines).strip()
+                q_src = q_lines
                 q_lines = []
-                plain = text.replace("**", "")
-                if plain.startswith("Note:"):
-                        body = text
-                        if body.startswith("**Note:**"):
-                                body = body[len("**Note:**") :].strip()
-                        html_body.append(
-                                f'<div class="callout info">\n  <span class="tag">Note</span>\n  {parse_inline(body)}\n</div>\n'
+
+                first = q_src[0].strip()
+                plain_first = first.replace("**", "")
+
+                # Note callouts: the tag carries the label, drop it from the body
+                if plain_first.startswith("Note:") and first.startswith("**Note:**"):
+                        rest = first[len("**Note:**") :].strip()
+                        q_src = ([rest] if rest else []) + q_src[1:]
+
+                # Render the quote's inner content — blockquotes may contain
+                # fenced code blocks and lists, so run a mini block-level pass
+                # instead of collapsing everything into one inline string.
+                parts = []
+                para = []
+                items = []
+                q_list_type = None
+                code_q = []
+                in_code_q = False
+
+                def q_flush_para():
+                        nonlocal para
+                        if not para:
+                                return
+                        parts.append(f"<p>{parse_inline(' '.join(para).strip())}</p>")
+                        para = []
+
+                def q_flush_list():
+                        nonlocal items, q_list_type
+                        if not items:
+                                return
+                        parts.append(f"<{q_list_type}>")
+                        for it in items:
+                                parts.append(f"  <li>{parse_inline(it)}</li>")
+                        parts.append(f"</{q_list_type}>")
+                        items = []
+                        q_list_type = None
+
+                def q_flush_code():
+                        nonlocal code_q, in_code_q
+                        if not in_code_q:
+                                return
+                        code_text = "\n".join(code_q)
+                        escaped = (
+                                code_text.replace("&", "&amp;")
+                                .replace("<", "&lt;")
+                                .replace(">", "&gt;")
                         )
-                elif plain.startswith(("Warning", "⚠️")):
+                        parts.append(f"<pre>{escaped}</pre>")
+                        code_q = []
+                        in_code_q = False
+
+                for ql in q_src:
+                        s = ql.strip()
+                        if in_code_q:
+                                if s.startswith("```"):
+                                        q_flush_code()
+                                else:
+                                        code_q.append(ql)
+                                continue
+                        if s.startswith("```"):
+                                q_flush_para()
+                                q_flush_list()
+                                in_code_q = True
+                                continue
+                        if not s:
+                                q_flush_para()
+                                q_flush_list()
+                                continue
+                        m_ol = re.match(r"^(\d+)\.\s+(.*)", s)
+                        m_ul = re.match(r"^([-\*])\s+(.*)", s)
+                        lm = m_ol or m_ul
+                        if lm:
+                                q_flush_para()
+                                lt = "ol" if m_ol else "ul"
+                                if q_list_type and q_list_type != lt:
+                                        q_flush_list()
+                                if not q_list_type:
+                                        q_list_type = lt
+                                items.append(lm.group(2))
+                                continue
+                        # Indented continuation of the previous list item
+                        if ql[:1].isspace() and items:
+                                items[-1] += " " + s
+                                continue
+                        q_flush_list()
+                        para.append(s)
+                q_flush_para()
+                q_flush_list()
+                q_flush_code()
+
+                inner = "\n  ".join(parts)
+                if plain_first.startswith("Note:"):
                         html_body.append(
-                                f'<div class="callout warn">\n  <span class="tag">Warning</span>\n  {parse_inline(text)}\n</div>\n'
+                                f'<div class="callout info">\n  <span class="tag">Note</span>\n  {inner}\n</div>\n'
+                        )
+                elif plain_first.startswith(("Warning", "⚠️")):
+                        html_body.append(
+                                f'<div class="callout warn">\n  <span class="tag">Warning</span>\n  {inner}\n</div>\n'
                         )
                 else:
                         html_body.append(
-                                f'<div class="callout info">\n  {parse_inline(text)}\n</div>\n'
+                                f'<div class="callout info">\n  {inner}\n</div>\n'
                         )
 
         def flush_list():

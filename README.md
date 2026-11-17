@@ -30,14 +30,67 @@ The whole process has two sides:
 
 ---
 
-## Quick Start — 10 commands on a ready host
+## Source Code
+
+The source code for these scripts is hosted on GitHub:
+
+- **Repository:** [https://github.com/aginies/coco_snp](https://github.com/aginies/coco_snp)
+- **Tarball:** [https://github.com/aginies/coco_snp/releases](https://github.com/aginies/coco_snp/releases) (when available)
+
+### Getting the scripts
+
+**Option 1 — Clone the repository (recommended for development or latest changes):**
+
+```bash
+git clone https://github.com/aginies/coco_snp.git
+cd coco_snp
+```
+
+This gives you the full history, all branches, and the ability to update with
+`git pull`.
+
+**Option 2 — Download a specific release tarball:**
+
+```bash
+VERSION="1.0.1"
+curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
+tar xzf coco_snp-${VERSION}.tar.gz
+cd coco_snp-${VERSION}
+```
+
+The tarball contains a versioned subdirectory with all scripts, the library,
+and documentation — ready to use without Git.
+
+**Option 3 — Download a single branch or tag:**
+
+```bash
+# Download a specific tag without cloning the full repo
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.1.tar.gz"
+tar xzf v1.0.1.tar.gz
+cd coco_snp-1.0.1
+```
+
+---
+
+## Quick Start — 11 commands on a ready host
 
 **Goal in one sentence:** prove to a remote verifier that the guest is a
 genuine, untampered SEV-SNP confidential VM, and only then hand it a secret.
 
-**The happy path (10 commands):**
+> **Before running the scripts:**
+>
+> 1. **Get the source code:** clone or download the repository to get `snp-attest.sh` — see [Source Code](#source-code):
+>    ```bash
+>    git clone https://github.com/aginies/coco_snp.git
+>    cd coco_snp
+>    ```
+
+**The happy path (11 commands):**
 
 ```bash
+# 0. Get the source code (if not already done)
+git clone https://github.com/aginies/coco_snp.git && cd coco_snp
+
 # 1. Host preparation & capability check
 sudo ./snp-attest.sh check
 
@@ -122,48 +175,6 @@ sudo ./snp-attest.sh secret-get --guest-ip <GUEST_IP> --path default/test/secret
 | [9. verify (consistency check)](#step-9--verify-everything-is-consistent-any-time) | No | No | No | **Recommended anytime** |
 | [10. clean (cleanup)](#step-10--cleanup-when-done) | Yes (destroys VM) | No | No | Only when done |
 | [11. Air-gapped / offline setup](#step-11--air-gapped--offline-setup-optional) | Yes (local cert store) | No (local) | No | **Yes** (only for offline hosts) |
-
----
-
-## Source Code
-
-The source code for these scripts is hosted on GitHub:
-
-- **Repository:** [https://github.com/aginies/coco_snp](https://github.com/aginies/coco_snp)
-- **Tarball:** [https://github.com/aginies/coco_snp/releases](https://github.com/aginies/coco_snp/releases) (when available)
-
-### Getting the scripts
-
-**Option 1 — Clone the repository (recommended for development or latest changes):**
-
-```bash
-git clone https://github.com/aginies/coco_snp.git
-cd coco_snp
-```
-
-This gives you the full history, all branches, and the ability to update with
-`git pull`.
-
-**Option 2 — Download a specific release tarball:**
-
-```bash
-VERSION="1.0.1"
-curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
-tar xzf coco_snp-${VERSION}.tar.gz
-cd coco_snp-${VERSION}
-```
-
-The tarball contains a versioned subdirectory with all scripts, the library,
-and documentation — ready to use without Git.
-
-**Option 3 — Download a single branch or tag:**
-
-```bash
-# Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.1.tar.gz"
-tar xzf v1.0.1.tar.gz
-cd coco_snp-1.0.1
-```
 
 ---
 

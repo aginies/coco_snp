@@ -11,6 +11,7 @@
 
 <nav class="toc">
   <h2>Contents</h2>
+  <a href="#source-code"><span class="n">•</span>Source Code</a>
   <a href="#prerequisites-before-any-script-command"><span class="n">•</span>Prerequisites</a>
   <a href="#detailed-steps-14-host-setup-individual"><span class="n">1</span>Detailed Steps 1–4 (host setup, individual)</a>
   <a href="#step-5--install-the-guest-os-manual"><span class="n">5</span>Install the guest OS (manual)</a>
@@ -46,13 +47,47 @@
   <li><strong>GUEST</strong> — the virtual machine that becomes an <strong>SEV-SNP confidential VM</strong>: its memory is encrypted <em>and</em> integrity-protected by the AMD SEV-SNP hardware, and its launch state is measured into a single <strong>launch digest</strong> that the CPU's PSP signs into an attestation report.</li>
 </ul>
 <div class="callout info">
-  <strong>SEV-SNP vs Intel TDX in one paragraph.</strong> Both are confidential-VM technologies, but the attestation data path is different. In TDX the guest cannot sign its own quote — it asks a <strong>host-side QGS</strong> service to sign a TD Report over vsock, and verification pulls PCK collateral from Intel PCS. In SEV-SNP the <strong>CPU's PSP signs the report in-guest</strong> (over the GHCB channel) with a <strong>VCEK</strong> derived from the launch measurement — there is no host quote daemon, no vsock quote path, and no per-platform registration. Collateral (the ARK → ASK → VCEK chain) comes from <strong>AMD KDS</strong>. That removes an entire setup step (no <code>setup-qgs</code>) and a whole class of host-side quote bugs.
+  <p><strong>SEV-SNP vs Intel TDX in one paragraph.</strong> Both are confidential-VM technologies, but the attestation data path is different. In TDX the guest cannot sign its own quote — it asks a <strong>host-side QGS</strong> service to sign a TD Report over vsock, and verification pulls PCK collateral from Intel PCS. In SEV-SNP the <strong>CPU's PSP signs the report in-guest</strong> (over the GHCB channel) with a <strong>VCEK</strong> derived from the launch measurement — there is no host quote daemon, no vsock quote path, and no per-platform registration. Collateral (the ARK → ASK → VCEK chain) comes from <strong>AMD KDS</strong>. That removes an entire setup step (no <code>setup-qgs</code>) and a whole class of host-side quote bugs.</p>
 </div>
 <hr>
-<h2 id="quick-start--10-commands-on-a-ready-host">Quick Start — 10 commands on a ready host</h2>
+<h2 id="source-code">Source Code</h2>
+<p>The source code for these scripts is hosted on GitHub:</p>
+<ul>
+  <li><strong>Repository:</strong> <a href="https://github.com/aginies/coco_snp">https://github.com/aginies/coco_snp</a></li>
+  <li><strong>Tarball:</strong> <a href="https://github.com/aginies/coco_snp/releases">https://github.com/aginies/coco_snp/releases</a> (when available)</li>
+</ul>
+<h3 id="getting-the-scripts">Getting the scripts</h3>
+<p class="caption"><strong>Option 1 — Clone the repository (recommended for development or latest changes):</strong></p>
+<pre>git clone https://github.com/aginies/coco_snp.git
+cd coco_snp</pre>
+<p>This gives you the full history, all branches, and the ability to update with <code>git pull</code>.</p>
+<p class="caption"><strong>Option 2 — Download a specific release tarball:</strong></p>
+<pre>VERSION="1.0.1"
+curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
+tar xzf coco_snp-${VERSION}.tar.gz
+cd coco_snp-${VERSION}</pre>
+<p>The tarball contains a versioned subdirectory with all scripts, the library, and documentation — ready to use without Git.</p>
+<p class="caption"><strong>Option 3 — Download a single branch or tag:</strong></p>
+<pre># Download a specific tag without cloning the full repo
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.1.tar.gz"
+tar xzf v1.0.1.tar.gz
+cd coco_snp-1.0.1</pre>
+<hr>
+<h2 id="quick-start--11-commands-on-a-ready-host">Quick Start — 11 commands on a ready host</h2>
 <p><strong>Goal in one sentence:</strong> prove to a remote verifier that the guest is a genuine, untampered SEV-SNP confidential VM, and only then hand it a secret.</p>
-<p class="caption"><strong>The happy path (10 commands):</strong></p>
-<pre># 1. Host preparation &amp; capability check
+<div class="callout info">
+  <p><strong>Before running the scripts:</strong></p>
+  <ol>
+    <li><strong>Get the source code:</strong> clone or download the repository to get <code>snp-attest.sh</code> — see <a href="#source-code">Source Code</a>:</li>
+  </ol>
+  <pre>   git clone https://github.com/aginies/coco_snp.git
+   cd coco_snp</pre>
+</div>
+<p class="caption"><strong>The happy path (11 commands):</strong></p>
+<pre># 0. Get the source code (if not already done)
+git clone https://github.com/aginies/coco_snp.git &amp;&amp; cd coco_snp
+
+# 1. Host preparation &amp; capability check
 sudo ./snp-attest.sh check
 
 sudo ./snp-attest.sh setup-host
@@ -71,7 +106,14 @@ sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv
 sudo ./snp-attest.sh secret-set --file /tmp/my-secret --path default/test/secret
 sudo ./snp-attest.sh secret-get --guest-ip &lt;GUEST_IP&gt; --path default/test/secret</pre>
 <div class="callout info">
-  <strong>Prerequisites before starting:</strong>  - AMD EPYC CPU with SEV-SNP (Rome / Genoa / Turin or later) - SEV-SNP enabled in BIOS (the CPU must report <code>sev_snp</code>) - SLES 16.1 installer ISO (from SUSE Customer Center) - Internet access to AMD KDS (or a local offline certificate store) - <a href="#prerequisites-before-any-script-command">Full prerequisites →</a>
+  <p><strong>Prerequisites before starting:</strong></p>
+  <ul>
+    <li>AMD EPYC CPU with SEV-SNP (Rome / Genoa / Turin or later)</li>
+    <li>SEV-SNP enabled in BIOS (the CPU must report <code>sev_snp</code>)</li>
+    <li>SLES 16.1 installer ISO (from SUSE Customer Center)</li>
+    <li>Internet access to AMD KDS (or a local offline certificate store)</li>
+    <li><a href="#prerequisites-before-any-script-command">Full prerequisites →</a></li>
+  </ul>
 </div>
 <hr>
 <h2 id="attestation-flow-remote-path-as-driven-by-this-guide">Attestation flow (remote path, as driven by this guide)</h2>
@@ -86,7 +128,7 @@ sudo ./snp-attest.sh secret-get --guest-ip &lt;GUEST_IP&gt; --path default/test/
 </ol>
 <div class="callout info">
   <span class="tag">Note</span>
-  the <code>snp-attest.sh</code> script drives the guest over <strong>ssh</strong> (<code>setup-guest</code>, <code>attest</code>, <code>secret-get</code>). The attestation data path itself is the in-guest report (PSP-signed) + HTTP (KBS). There is <strong>no vsock quote channel</strong> — that is a TDX/QGS artifact, not an SEV-SNP one.
+  <p>the <code>snp-attest.sh</code> script drives the guest over <strong>ssh</strong> (<code>setup-guest</code>, <code>attest</code>, <code>secret-get</code>). The attestation data path itself is the in-guest report (PSP-signed) + HTTP (KBS). There is <strong>no vsock quote channel</strong> — that is a TDX/QGS artifact, not an SEV-SNP one.</p>
 </div>
 <hr>
 <h2 id="choose-your-path">Choose your path</h2>
@@ -116,29 +158,6 @@ sudo ./snp-attest.sh secret-get --guest-ip &lt;GUEST_IP&gt; --path default/test/
   <tr><td><a href="#step-11--air-gapped--offline-setup-optional">11. Air-gapped / offline setup</a></td><td>Yes (local cert store)</td><td>No (local)</td><td>No</td><td><strong>Yes</strong> (only for offline hosts)</td></tr>
 </table>
 <hr>
-<h2 id="source-code">Source Code</h2>
-<p>The source code for these scripts is hosted on GitHub:</p>
-<ul>
-  <li><strong>Repository:</strong> <a href="https://github.com/aginies/coco_snp">https://github.com/aginies/coco_snp</a></li>
-  <li><strong>Tarball:</strong> <a href="https://github.com/aginies/coco_snp/releases">https://github.com/aginies/coco_snp/releases</a> (when available)</li>
-</ul>
-<h3 id="getting-the-scripts">Getting the scripts</h3>
-<p class="caption"><strong>Option 1 — Clone the repository (recommended for development or latest changes):</strong></p>
-<pre>git clone https://github.com/aginies/coco_snp.git
-cd coco_snp</pre>
-<p>This gives you the full history, all branches, and the ability to update with <code>git pull</code>.</p>
-<p class="caption"><strong>Option 2 — Download a specific release tarball:</strong></p>
-<pre>VERSION="1.0.1"
-curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
-tar xzf coco_snp-${VERSION}.tar.gz
-cd coco_snp-${VERSION}</pre>
-<p>The tarball contains a versioned subdirectory with all scripts, the library, and documentation — ready to use without Git.</p>
-<p class="caption"><strong>Option 3 — Download a single branch or tag:</strong></p>
-<pre># Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.1.tar.gz"
-tar xzf v1.0.1.tar.gz
-cd coco_snp-1.0.1</pre>
-<hr>
 <h2 id="prerequisites-before-any-script-command">Prerequisites <span>(before any script command)</span></h2>
 <table>
   <tr><th>Requirement</th></tr>
@@ -154,7 +173,7 @@ cd coco_snp-1.0.1</pre>
   <tr><td>SLES 16.1 installer ISO</td><td>SUSE Customer Center (subscription)</td><td><code>setup-vm</code> / <code>all</code> (<code>--guest-iso</code>) and the manual install in Step 5</td></tr>
 </table>
 <div class="callout info">
-  <strong>No platform registration needed.</strong> Unlike Intel TDX (Xeon 6 / Scalable platforms must be registered before PCK certificates are issued), SEV-SNP needs <strong>no per-platform registration</strong>. The VCEK is derived from the VM's launch measurement and chained to AMD's public ARK/ASK root — fetched from KDS. If <code>check</code> reports the CPU does not advertise SEV-SNP, the fix is a BIOS setting, not a registration.
+  <p><strong>No platform registration needed.</strong> Unlike Intel TDX (Xeon 6 / Scalable platforms must be registered before PCK certificates are issued), SEV-SNP needs <strong>no per-platform registration</strong>. The VCEK is derived from the VM's launch measurement and chained to AMD's public ARK/ASK root — fetched from KDS. If <code>check</code> reports the CPU does not advertise SEV-SNP, the fix is a BIOS setting, not a registration.</p>
 </div>
 <div class="callout warn">
   <span class="tag">Warning</span>
@@ -174,7 +193,7 @@ cd coco_snp-1.0.1</pre>
 <div class="step" id="detailed-steps-14-host-setup-individual">
 <h2>Detailed Steps 1–4 (host setup, individual)</h2>
 <div class="callout info">
-  <strong>Skip this section if you used <code>snp-attest.sh all</code>.</strong> These are the individual commands for when you want to run each layer one-by-one (debugging, custom setups, incremental re-runs).
+  <p><strong>Skip this section if you used <code>snp-attest.sh all</code>.</strong> These are the individual commands for when you want to run each layer one-by-one (debugging, custom setups, incremental re-runs).</p>
 </div>
 </div>
 
@@ -204,7 +223,7 @@ cd coco_snp-1.0.1</pre>
 <p><strong>Expected result:</strong> all rows PASS (WARN is non-fatal).</p>
 <p><strong>If FAIL:</strong> read the HINT column — it tells you the exact fix (BIOS setting, package to install, service to start).</p>
 <div class="callout info">
-  <strong>Tip — deep platform validity check:</strong> run <code>sudo ./snp-attest.sh check --check-platform</code> (or the standalone <code>check-platform</code> command) to fetch the full ARK → ASK → VCEK chain from AMD KDS and verify the chain + TCB OIDs with <code>snphost</code>. Unlike TDX, there is no per-platform <em>registration</em> to validate — SEV-SNP has no PCK certificates — so this is a pure collateral/TCB check, not a "is my platform registered" check.
+  <p><strong>Tip — deep platform validity check:</strong> run <code>sudo ./snp-attest.sh check --check-platform</code> (or the standalone <code>check-platform</code> command) to fetch the full ARK → ASK → VCEK chain from AMD KDS and verify the chain + TCB OIDs with <code>snphost</code>. Unlike TDX, there is no per-platform <em>registration</em> to validate — SEV-SNP has no PCK certificates — so this is a pure collateral/TCB check, not a "is my platform registered" check.</p>
 </div>
 <hr>
 </div>
@@ -247,7 +266,9 @@ cd coco_snp-1.0.1</pre>
   <li><em>Why:</em> Step 7 uses <code>grpcurl</code> to communicate directly with the CoCo-AS gRPC service for report appraisal.</li>
 </ul>
 <div class="callout info">
-  <strong>Tip — air-gapped / offline collateral:</strong> When the host cannot reach AMD KDS, import the certificate chain once while online (or from a trusted source) and use <code>--collateral offline</code>:  ``<code>bash sudo ./snp-attest.sh setup-host --collateral offline </code>`<code>  The offline store is </code>/var/lib/sev-snp/certs/{ark,ask,vcek}.pem`. See <a href="#step-11--air-gapped--offline-setup-optional">Step 11</a> for the full air-gapped flow.
+  <p><strong>Tip — air-gapped / offline collateral:</strong> When the host cannot reach AMD KDS, import the certificate chain once while online (or from a trusted source) and use <code>--collateral offline</code>:</p>
+  <pre>sudo ./snp-attest.sh setup-host --collateral offline</pre>
+  <p>The offline store is <code>/var/lib/sev-snp/certs/{ark,ask,vcek}.pem</code>. See <a href="#step-11--air-gapped--offline-setup-optional">Step 11</a> for the full air-gapped flow.</p>
 </div>
 <p class="caption"><strong>Verify:</strong></p>
 <pre>rpm -qa | grep -i snphost                       # package present
@@ -331,7 +352,7 @@ virsh -c qemu:///system version                 # libvirt answers</pre>
 <pre>systemctl is-active grpc-as kbs rvps           # all active
 ss -tln | grep -E '3000|8080'                  # ports listening</pre>
 <div class="callout info">
-  <strong>Note — lab vs production:</strong> this setup is deliberately a <strong>lab configuration</strong>. Three things are permissive and must be changed for real use: (1) the resource policy is <strong>allow-all</strong> — any attested client can fetch any secret; in production, gate it on real claims (e.g. <code>snp.report.id_block</code>). (2) KBS runs with <code>insecure_http</code> + <code>InsecureAllowAll</code> — no TLS, no tenant isolation. (3) the host-mode <code>secret-get</code> (Method B) leaves the EAR token on the host, so anyone holding it can fetch the secret — use the in-guest <code>kbs-client</code> (Method A) for real secret gating.
+  <p><strong>Note — lab vs production:</strong> this setup is deliberately a <strong>lab configuration</strong>. Three things are permissive and must be changed for real use: (1) the resource policy is <strong>allow-all</strong> — any attested client can fetch any secret; in production, gate it on real claims (e.g. <code>snp.report.id_block</code>). (2) KBS runs with <code>insecure_http</code> + <code>InsecureAllowAll</code> — no TLS, no tenant isolation. (3) the host-mode <code>secret-get</code> (Method B) leaves the EAR token on the host, so anyone holding it can fetch the secret — use the in-guest <code>kbs-client</code> (Method A) for real secret gating.</p>
 </div>
 <hr>
 </div>
@@ -411,7 +432,7 @@ ss -tln | grep -E '3000|8080'                  # ports listening</pre>
 virsh shutdown &lt;vm&gt;
 sudo ./snp-attest.sh convert-snp --convert-vm &lt;vm&gt;</pre>
 <div class="callout info">
-  <strong>Tip:</strong> If <code>--convert-vm</code> is omitted, <code>convert-snp</code> automatically detects running/available VMs and prompts interactively.
+  <p><strong>Tip:</strong> If <code>--convert-vm</code> is omitted, <code>convert-snp</code> automatically detects running/available VMs and prompts interactively.</p>
 </div>
 <p><code>convert-snp</code> edits the domain XML in place (removes the regular loader so the SNP firmware is autoselected, adds <code>launchSecurity type='sev-snp'</code> + <code>vsock</code>, disables suspend) using an inline Python (ElementTree) XML transformer, with automatic backup and rollback. <em>Why Python:</em> bash text munging of XML is fragile; ElementTree parses it properly.</p>
 <p class="caption"><strong>Verify:</strong></p>
@@ -444,7 +465,7 @@ virsh dumpxml snp-guest | grep -E 'launchSecurity|vsock|policy'</pre>
   <li><em>Why:</em> the guest got DHCP on libvirt's default network; the script needs this IP for SSH.</li>
 </ul>
 <div class="callout info">
-  <strong>Tip — Guest IP auto-detection:</strong> When only one VM is running, subsequent commands (<code>setup-guest</code>, <code>attest</code>, <code>register-rv</code>, <code>secret-get</code>) will auto-detect the guest IP if <code>--guest-ip</code> is omitted.
+  <p><strong>Tip — Guest IP auto-detection:</strong> When only one VM is running, subsequent commands (<code>setup-guest</code>, <code>attest</code>, <code>register-rv</code>, <code>secret-get</code>) will auto-detect the guest IP if <code>--guest-ip</code> is omitted.</p>
 </div>
 <ol>
   <li><strong>If you skipped key injection (fresh disk), inject it now:</strong></li>
@@ -526,7 +547,7 @@ virsh dumpxml snp-guest | grep -E 'launchSecurity|vsock|policy'</pre>
 <p class="caption"><strong>Command (on the host):</strong></p>
 <pre>sudo ./snp-attest.sh attest --guest-ip &lt;GUEST_IP&gt; --register-rv</pre>
 <div class="callout info">
-  <strong>Default:</strong> <code>--register-rv</code> is recommended on a <strong>fresh</strong> setup — it enrolls the guest's launch identity in RVPS <em>and</em> re-evaluates the same report, giving a clean <code>ear.status = affirming</code> in one step. See <a href="#enrolling-reference-values-into-rvps">below</a> for details. &gt; <strong>Once enrolled, it stays enrolled.</strong> Reference values persist in RVPS &gt; (<code>/var/lib/attestation-service/storage/reference_value/</code>), so after the &gt; first registration a <strong>plain <code>attest</code> (no <code>--register-rv</code>) already returns &gt; <code>affirming</code></strong>. You only need <code>--register-rv</code> again if you change the guest's &gt; launch identity (different OVMF/kernel → different measurement) or if RVPS &gt; was emptied.
+  <p><strong>Default:</strong> <code>--register-rv</code> is recommended on a <strong>fresh</strong> setup — it enrolls the guest's launch identity in RVPS <em>and</em> re-evaluates the same report, giving a clean <code>ear.status = affirming</code> in one step. See <a href="#enrolling-reference-values-into-rvps">below</a> for details. &gt; <strong>Once enrolled, it stays enrolled.</strong> Reference values persist in RVPS &gt; (<code>/var/lib/attestation-service/storage/reference_value/</code>), so after the &gt; first registration a <strong>plain <code>attest</code> (no <code>--register-rv</code>) already returns &gt; <code>affirming</code></strong>. You only need <code>--register-rv</code> again if you change the guest's &gt; launch identity (different OVMF/kernel → different measurement) or if RVPS &gt; was emptied.</p>
 </div>
 <p class="caption"><strong>What it does, in order:</strong></p>
 <ol>
@@ -654,7 +675,7 @@ sudo ./snp-attest.sh secret-set --file /tmp/my-secret --path default/test/secret
 <p class="caption"><strong>Expected output (both):</strong></p>
 <pre>=== SECRET DELIVERY SUCCESS: attestation passed, secret released ===</pre>
 <div class="callout info">
-  <strong>Tip — saving secrets to file:</strong> By default, <code>secret-get</code> prints text secrets to stdout. For binary secrets (or direct persistence), pass <code>--file &lt;DEST_PATH&gt;</code>. In Method A this saves the secret directly to the file inside the guest; in Method B it saves it to the host filesystem.
+  <p><strong>Tip — saving secrets to file:</strong> By default, <code>secret-get</code> prints text secrets to stdout. For binary secrets (or direct persistence), pass <code>--file &lt;DEST_PATH&gt;</code>. In Method A this saves the secret directly to the file inside the guest; in Method B it saves it to the host filesystem.</p>
 </div>
 <hr>
 </div>
@@ -709,7 +730,7 @@ sudo ./snp-attest.sh secret-set --file /tmp/my-secret --path default/test/secret
 </ul>
 <p>Without the offline store, the SNP stack fetches collateral from AMD KDS at runtime (<code>https://kdsintf.amd.com/vcek/v1</code>). With the offline store, it reads from <code>/var/lib/sev-snp/certs/</code> instead.</p>
 <div class="callout info">
-  <strong>SEV-SNP vs TDX offline:</strong> TDX needs a full <strong>PCCS</strong> server (Node.js + SQLite) to cache PCK/TCB/QE collateral, plus a one-time <strong>platform registration</strong> while online. SEV-SNP needs <strong>neither</strong> — just the three PEM files. There is no per-platform registration to do while online, which makes the air-gapped transition much simpler.
+  <p><strong>SEV-SNP vs TDX offline:</strong> TDX needs a full <strong>PCCS</strong> server (Node.js + SQLite) to cache PCK/TCB/QE collateral, plus a one-time <strong>platform registration</strong> while online. SEV-SNP needs <strong>neither</strong> — just the three PEM files. There is no per-platform registration to do while online, which makes the air-gapped transition much simpler.</p>
 </div>
 <h3 id="prerequisites-for-air-gapped-operation">Prerequisites for air-gapped operation</h3>
 <table>
@@ -737,7 +758,7 @@ sudo ./snp-attest.sh setup-trustee --collateral offline
 sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso --collateral offline</pre>
 <div class="callout info">
   <span class="tag">Note</span>
-  the <code>--collateral offline</code> flag tells <code>setup-host</code> to use the local store (not fetch from KDS) and <code>setup-trustee</code> to configure CoCo-AS to read the local store. <code>setup-vm</code> doesn't directly use the flag but benefits from the host being configured.
+  <p>the <code>--collateral offline</code> flag tells <code>setup-host</code> to use the local store (not fetch from KDS) and <code>setup-trustee</code> to configure CoCo-AS to read the local store. <code>setup-vm</code> doesn't directly use the flag but benefits from the host being configured.</p>
 </div>
 <h4>5. Complete the remaining steps (5–10) as usual</h4>
 <p>Steps 5–10 (guest OS install, guest setup, attestation, secret delivery, verify, cleanup) are <strong>identical</strong> to the online flow. The only difference is that report verification reads the ARK/ASK/VCEK chain from the local store instead of AMD KDS.</p>
@@ -795,7 +816,7 @@ sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso --collateral off
 <pre>sudo ./snp-attest.sh &lt;command&gt; -d</pre>
 <div class="callout info">
   <span class="tag">Note</span>
-  options always come <strong>after</strong> the command — <code>snp-attest.sh -d check</code> is rejected with <code>Unknown option: check</code>.
+  <p>options always come <strong>after</strong> the command — <code>snp-attest.sh -d check</code> is rejected with <code>Unknown option: check</code>.</p>
 </div>
 <hr>
 <h2 id="acronym-glossary">Acronym Glossary</h2>
