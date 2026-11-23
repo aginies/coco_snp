@@ -1,7 +1,8 @@
 # Trustee 0.23: grpc-as panics on every attestation request
 
 Status: **open upstream** (no fix on `confidential-containers/trustee` `main`
-as of commit `9dd128c`, 2026-11-23). **Workaround implemented in this repo**:
+as of commit `9dd128c`, 2026-11-23). **Workaround implemented in this repo, verified on genoa-sev1 (SLES 16.1,
+trustee 0.23): `Verifier/endorsement check passed`, no panic.**
 CoCo-AS uses only the `OfflineStore` VCEK source, and `snp-attest.sh` fills
 that store from AMD KDS with `curl` on the host. `grpc-as` never builds its own
 HTTPS client.
@@ -198,6 +199,14 @@ BREAKING) renamed the token claims:
 The SNP claim names themselves (`measurement`, `chip_id`,
 `reported_tcb_*`, `policy_*`, `platform_*`) and the RVPS reference-value IDs
 (`snp_launch_measurement`, `snp_bootloader`, ...) are unchanged.
+
+The trustworthiness vector values are AR4SI codes, not a 0–100 score. With
+the default policy, `hardware 2` means the reported TCB is in RVPS and `97`
+means it is not recognised. Older versions of this script treated `>= 50` as
+"hardware verified", which inverted the meaning. On 0.23 that showed up as
+`TCB Status: Unknown` and `ATTESTATION FAILED` even though the token was
+valid. `attest` now treats an issued token with SNP claims as proof that the
+VCEK chain verified, and prints each vector claim with its tier and meaning.
 
 `snp-attest.sh` parses both layouts (`snp_ear_fields`, `snp_rv_sample`, the
 `--register-rv` re-evaluation). Without this, `attest` showed

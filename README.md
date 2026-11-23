@@ -829,10 +829,20 @@ tokens" at the end of this guide.)*
 
 The `attest` command decodes the EAR token (a JWT built on EAT, RFC 9711):
 extracts the payload, formats the claims, displays a structured verification
-report, and checks the EAR status together with the hardware
-trustworthiness vector (0–100). There is no `submods.cpu0.tcb_status` for SNP,
-so hardware verification is read from the vector. Both EAR claim layouts are
-parsed:
+report, and checks the EAR status. There is no `submods.cpu0.tcb_status` for
+SNP. CoCo-AS only issues a token once the report signature and the
+ARK → ASK → VCEK chain have verified, so a token with SNP claims means the
+hardware check passed. The trustworthiness vector holds the RVPS appraisal in
+AR4SI codes, **not** a 0–100 score: 2–31 affirming, 32–95 warning, 96–127
+contraindicated. `attest` prints one line per claim:
+
+| Claim | Affirming (default policy) | Otherwise |
+| --- | --- | --- |
+| `hardware` | `2`: reported TCB (bl/tee/snp/ucode) in RVPS | `97`: TCB not enrolled |
+| `configuration` | `2`/`3`: guest policy / platform config approved or safe | `36` |
+| `executables` | `3`: launch measurement in RVPS | `33`: measurement not enrolled |
+
+Both EAR claim layouts are parsed:
 
 | trustee <= 0.22 | trustee >= 0.23 (EAR draft-04) |
 | --- | --- |
@@ -923,8 +933,11 @@ to enroll) but you lose the per-stage granularity TDX's RTMRs give you.
   matches enrolled RVPS reference values. This is the success state.
 - **`contraindicated`** — hardware verification passed but no (or mismatched)
   RVPS reference values exist. Fix: `attest --register-rv` (or `register-rv`).
-- **`warning`** — hardware verified, but a non-critical claim is off (e.g. TCB
-  is `OutOfDate` — update microcode/BIOS, or the KDS cache is stale).
+- **`warning`** — hardware verified, but one claim is only in the warning tier.
+  The most common case is `executables=33`: the launch measurement is not in
+  RVPS because OVMF, the kernel or the launch policy changed since the last
+  `register-rv`. If you trust the new identity, re-enroll it with
+  `attest --register-rv`.
 
 **If it fails:**
 
@@ -1210,7 +1223,7 @@ was verified" — that's why the script can use it as a bearer token in Step 8.
 | `setup-vm`: `virt-customize: no operating systems were found in the guest image` | Reusing a leftover **empty** disk (no OS, from an aborted install) — it has no partition table/filesystem | setup-vm now detects this and offers to remove the empty disk for a clean install (or keep it; the installer writes to it). To do it manually: run `./snp-attest.sh clean` first to destroy the old VM + disk, then re-run `setup-vm` |
 | `snpguest report`: "Failed to get the report" | `/dev/sev-guest` not present or GHCB not set up | Confirm the VM is a real SNP guest (Step 6 item 3); check the guest kernel has the `sev-guest` driver |
 | Attestation: `ear.status: contraindicated` | RVPS values missing (fresh RVPS) or mismatched | Run `sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv` to enroll the current identity, or check `journalctl -u grpc-as.service -n 50`. Note: once values are enrolled they **persist** in RVPS, so a plain `attest` already returns `affirming` — `contraindicated` means the store is empty or the guest's launch identity changed. |
-| Attestation: `ear.status: warning` (TCB OutOfDate) | Reported TCB older than KDS's current TCB | Update guest microcode/BIOS, or refresh the KDS cache / offline store |
+| Attestation: `ear_status: warning` | Usually `executables=33`: the launch measurement is not in RVPS (guest OVMF/kernel/policy changed). With `hardware=97`, the reported TCB is not enrolled (firmware update) | If the new identity is trusted: `sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv` |
 | `attest`: `Code: Canceled ... RST_STREAM with error code: CANCEL`; `grpc-as` log: `panicked at ... Client::new(): reqwest::Error { kind: Builder ...}` | trustee 0.23 KDS VCEK source: the in-process HTTPS client fails to initialise on SLES 16.1 | `sudo ./snp-attest.sh setup-trustee` (switches to the `OfflineStore` VCEK source), then `attest`. See [TRUSTEE-0.23-GRPC-AS-PANIC.md](TRUSTEE-0.23-GRPC-AS-PANIC.md) |
 | `grpc-as` log: `Failed to fetch VCEK from any configured source` | No VCEK for this chip / TCB in `/var/lib/attestation-service/kds-store` | `sudo ./snp-attest.sh vcek-fetch --guest-ip <GUEST_IP>` (needs KDS access, or `/var/lib/sev-snp/certs/vcek.pem`) |
 | `attest` shows `EAR Status: Unknown` with an old copy of the script | trustee 0.23 renamed EAR claims (`ear.status` → `ear_status`) | Update the scripts; both layouts are parsed |

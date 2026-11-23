@@ -373,19 +373,30 @@ jwt_decode_payload() {
 }
 
 # Extract the SNP report fields from a decoded EAR JWT payload. Prints
-# space-separated: ear_status id_block id_auth launch_digest policy vmpl
-# report_id report_id_ma chip_id tcb_status
+# '|'-delimited: ear_status id_block id_auth launch_digest policy vmpl
+# report_id report_id_ma chip_id tcb_status appraisal
 snp_ear_fields() {
     # Reads the flat SNP claims produced by the Trustee snp_verifier: the
     # fields live directly under
     #   submods.cpu0.ear_attester_claims.claims               (trustee >= 0.23)
     #   submods.cpu0."ear.veraison.annotated-evidence".snp    (trustee <= 0.22)
     # (chip_id, measurement, reported_tcb_*), NOT nested under a 'report'
-    # key, and there is NO 'tcb_status' field — AMD KDS verification is
-    # signalled by the trustworthiness vector "hardware" claim (0..100).
+    # key, and there is NO 'tcb_status' field.
+    #
+    # Hardware (VCEK chain) verification: CoCo-AS only issues a token after
+    # the snp_verifier accepted the report signature and the ARK -> ASK ->
+    # VCEK chain, so SNP claims in the token mean the chain verified.
+    #
+    # The trustworthiness vector is the RVPS appraisal, in AR4SI codes (NOT a
+    # 0..100 score): 0/1 = no claim, 2..31 affirming, 32..95 warning,
+    # 96..127 contraindicated. With the default policy (ear_default_policy_cpu
+    # .rego): hardware 2 = reported TCB in RVPS (97 = not recognised),
+    # configuration 2/3 = approved / safe config (36 = not), executables 3 =
+    # launch measurement in RVPS (33 = not recognised).
+    #
     # Output is '|' delimited (not whitespace): empty fields are preserved and
-    # values may contain spaces (e.g. the TCB status text), so `read` cannot
-    # shift the columns.
+    # values may contain spaces, so `read` cannot shift the columns. The
+    # appraisal column is ';'-separated "claim=value tier meaning" entries.
     local jwt_json="$1"
     [[ -n "$jwt_json" ]] || return 0
     if command -v python3 >/dev/null 2>&1; then
@@ -405,12 +416,40 @@ try:
     chip_id = snp.get('chip_id', '')
     tw = (submod.get('ear_trustworthiness_vector')
           or submod.get('ear.trustworthiness-vector', {}))
-    hardware_tw = tw.get('hardware', '')
-    if str(hardware_tw) not in ('', 'None') and int(hardware_tw) >= 50:
-        tcb_status = 'Verified (hardware trustworthiness %s%%)' % hardware_tw
-    else:
-        tcb_status = ''
-    print('|'.join([ear_status, '', '', '', '', '', '', '', chip_id, tcb_status]))
+    def tier(v):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return 'none'
+        if 2 <= v <= 31:
+            return 'affirming'
+        if 32 <= v <= 95:
+            return 'warning'
+        if 96 <= v <= 127:
+            return 'contraindicated'
+        return 'none'
+    why = {
+        'hardware': ('reported TCB matches RVPS',
+                     'reported TCB not in RVPS (snp_bootloader/microcode/snp_svn/tee_svn)'),
+        'configuration': ('guest policy/platform config approved',
+                          'guest policy/platform config not approved (RVPS snp_* config values, debug/migrate)'),
+        'executables': ('launch measurement matches RVPS',
+                        'launch measurement not in RVPS (snp_launch_measurement)'),
+    }
+    appraisal = []
+    for claim, (good, bad) in why.items():
+        if claim not in tw:
+            continue
+        t = tier(tw[claim])
+        appraisal.append('%s=%s %s: %s' % (claim, tw[claim], t,
+                                          good if t == 'affirming' else bad))
+    tcb_status = ''
+    if snp:
+        tcb = '/'.join(str(snp.get('reported_tcb_' + k, '?'))
+                       for k in ('bootloader', 'tee', 'snp', 'microcode'))
+        tcb_status = 'Verified (ARK->ASK->VCEK, reported TCB bl/tee/snp/ucode %s)' % tcb
+    print('|'.join([ear_status, '', '', snp.get('measurement', ''), '', '', '', '',
+                    chip_id, tcb_status, ';'.join(appraisal)]))
 except Exception:
     pass
 " || true
@@ -569,11 +608,11 @@ cmd_attest() {
     log "Checking CoCo-AS service log"
     journalctl -u grpc-as.service -n 20 --no-pager 2>/dev/null || true
 
-    local ear_status="" tcb_status="" id_block="" id_auth="" launch_digest="" policy="" vmpl="" report_id="" chip_id=""
+    local ear_status="" tcb_status="" id_block="" id_auth="" launch_digest="" policy="" vmpl="" report_id="" chip_id="" appraisal=""
     local fields
     fields=$(snp_ear_fields "$jwt_json")
     if [[ -n "$fields" ]]; then
-        IFS='|' read -r ear_status id_block id_auth launch_digest policy vmpl report_id _ chip_id tcb_status <<<"$fields"
+        IFS='|' read -r ear_status id_block id_auth launch_digest policy vmpl report_id _ chip_id tcb_status appraisal <<<"$fields"
     fi
     if [[ -z "$ear_status" ]]; then
         ear_status=$(echo "$jwt_json" | grep -oP '"ear[._]status"\s*:\s*"\K[^"]+' | head -n1 || true)
@@ -614,16 +653,9 @@ cmd_attest() {
             attest_evaluate_report "$LAST_REPORT_B64"
             token="$EAR_TOKEN"
             jwt_json=$(jwt_decode_payload "$token") || jwt_json=""
-            if command -v python3 >/dev/null 2>&1; then
-                ear_status=$(python3 -c "
-import sys, json
-try:
-    d = json.loads(sys.stdin.read())
-    c = d.get('submods', {}).get('cpu0', {})
-    print(c.get('ear_status') or c.get('ear.status', ''))
-except Exception:
-    pass
-" <<<"$jwt_json")
+            fields=$(snp_ear_fields "$jwt_json")
+            if [[ -n "$fields" ]]; then
+                IFS='|' read -r ear_status _ _ launch_digest _ _ _ _ chip_id tcb_status appraisal <<<"$fields"
             else
                 ear_status=$(echo "$jwt_json" | grep -oP '"ear[._]status"\s*:\s*"\K[^"]+' | head -n1 || true)
             fi
@@ -646,6 +678,12 @@ except Exception:
     [[ -n "$report_id" ]] && log "    Report ID:            ${report_id}"
     log "  Trustee Appraisal Result (RVPS):"
     log "    EAR Status:             ${ear_status:-Unknown}"
+    local entry
+    if [[ -n "$appraisal" ]]; then
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] && log "      ${entry}"
+        done <<<"${appraisal//;/$'\n'}"
+    fi
     log "============================================================================="
     echo ""
 
@@ -655,10 +693,11 @@ except Exception:
         trap - ERR
         return 0
     elif [[ -n "$tcb_status" && "$tcb_status" != "Revoked" ]]; then
-        log "=== HARDWARE ATTESTATION SUCCESS: report verified via AMD KDS (TCB: ${tcb_status}) ==="
-        if [[ "$ear_status" == "contraindicated" ]]; then
-            warn "Appraisal status is 'contraindicated' because reference values are not enrolled in RVPS."
-            warn "To register current guest identity in RVPS and achieve 'affirming' status, run:"
+        log "=== HARDWARE ATTESTATION SUCCESS: report signature and VCEK chain verified ==="
+        if [[ "$ear_status" == "contraindicated" || "$ear_status" == "warning" ]]; then
+            warn "Appraisal status is '${ear_status}': the guest does not fully match the RVPS reference"
+            warn "values (see the claims marked warning/contraindicated above). If this guest's launch"
+            warn "identity is the one you trust (e.g. after an OVMF/kernel or firmware change), re-enroll it:"
             warn "  snp-attest.sh attest --guest-ip ${GUEST_IP} --register-rv"
             warn "  or: snp-attest.sh register-rv --guest-ip ${GUEST_IP}"
         fi
@@ -666,7 +705,7 @@ except Exception:
         return 0
     else
         error "=== ATTESTATION FAILED: Invalid or rejected attestation token ==="
-        error "Check grpc-as logs and AMD KDS connectivity."
+        error "Check grpc-as logs and the CoCo-AS VCEK store (${AS_KDS_STORE})."
         trap - ERR
         return 1
     fi
