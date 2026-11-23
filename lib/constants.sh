@@ -7,7 +7,7 @@
 # shellcheck disable=SC2034,SC2155
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.3"
+readonly SCRIPT_VERSION="1.0.4"
 # SCRIPT_DIR is defined in the main script before sourcing these files.
 
 # Platform check
@@ -128,6 +128,12 @@ readonly KBS_CONF="/etc/kbs.json"
 readonly KBS_JWKS_FILE="/etc/trustee/jwks.json"
 readonly RVPS_CONF="/etc/rvps.json"
 readonly AS_STORAGE_DIR="/var/lib/attestation-service/storage"
+# CoCo-AS offline VCEK store (snp_verifier "OfflineStore" VCEK source, trustee
+# >= 0.23). Layout: ${AS_KDS_STORE}/vcek/<hw_id>/<tcb_prefix>_vcek.der (or a
+# flat vcek.der). The script fills it from AMD KDS with curl on the host, so
+# grpc-as never builds its own HTTPS client (trustee 0.23 panics there on
+# SLES 16.1, see TRUSTEE-0.23-GRPC-AS-PANIC.md).
+readonly AS_KDS_STORE="/var/lib/attestation-service/kds-store"
 
 # Trustee / KBS admin material (for secret delivery)
 readonly TRUSTEE_DIR="/etc/trustee"

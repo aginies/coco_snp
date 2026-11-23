@@ -49,7 +49,7 @@ fetch_kds_certs() {
     # post-fetch normalization is needed.
     if [[ "$KDS_URL" != "https://kdsintf.amd.com/vcek/v1" ]]; then
         warn "--kds-url (${KDS_URL}) is not honoured by 'snphost fetch' (it has no such option);"
-        warn "it is only used for the CoCo-AS collateral_service setting and the reachability probe."
+        warn "it is only used for the CoCo-AS VCEK store fetch (ensure_as_vcek) and the reachability probe."
     fi
     log "Fetching the AMD CA chain (ARK/ASK) from KDS into ${SNP_CERT_DIR}"
     if ! run snphost fetch ca pem "$SNP_CERT_DIR"; then
@@ -239,8 +239,6 @@ cmd_setup_trustee() {
     setup_collateral_source ||
         die "Could not prepare the attestation collateral (--collateral ${COLLATERAL_MODE});
 CoCo-AS would be configured against a source it cannot use."
-    local as_collateral
-    as_collateral=$(kds_url)
     log "Writing CoCo-AS config: $GRPC_AS_CONF"
     mkdir -p "$AS_STORAGE_DIR"
     if id coco_as >/dev/null 2>&1; then
@@ -249,29 +247,27 @@ CoCo-AS would be configured against a source it cannot use."
     # Persistent signer so grpc-as serves a stable JWKS endpoint for KBS.
     ensure_as_signer_key
 
-    # The snp_verifier config differs from TDX's dcap_verifier: it points at
-    # the AMD KDS (or the offline cert store) for the ARK/ASK/VCEK chain. The
-    # exact field names depend on the Trustee version; the two most common
-    # layouts are written here (collateral_service for KDS, local_collateral_path
-    # for offline). CoCo-AS ignores fields it does not recognize.
+    # snp_verifier VCEK source (trustee >= 0.23 reads only "vcek_sources";
+    # unknown keys such as the old collateral_service / local_collateral_path
+    # are silently ignored, which made 0.23 fall back to its default KDS
+    # source). The KDS source makes grpc-as build an in-process reqwest HTTPS
+    # client, and on SLES 16.1 trustee 0.23 that panics on every request
+    # ("Client::new(): reqwest::Error { kind: Builder ... }"). So both
+    # collateral modes use the OfflineStore source only: the VCEK is fetched
+    # on the host (curl, from ${KDS_URL}) or taken from the snphost store
+    # (offline mode) and dropped into ${AS_KDS_STORE} by 'attest' /
+    # 'secret-get' / 'vcek-fetch' (see ensure_as_vcek in lib/attest.sh).
+    # Trustee 0.22 ignores vcek_sources and keeps using KDS, which works there.
+    prepare_as_kds_store
     local verifier_block
-    if [[ "$COLLATERAL_MODE" == "offline" ]]; then
-        verifier_block=$(cat <<EOF
+    verifier_block=$(cat <<EOF
     "snp_verifier": {
-      "local_collateral_path": "${SNP_CERT_DIR}",
-      "use_secure_cert": false
+      "vcek_sources": [
+        { "type": "OfflineStore", "path": "${AS_KDS_STORE}" }
+      ]
     }
 EOF
 )
-    else
-        verifier_block=$(cat <<EOF
-    "snp_verifier": {
-      "collateral_service": "${as_collateral}",
-      "use_secure_cert": true
-    }
-EOF
-)
-    fi
 
     cat >"$GRPC_AS_CONF" <<EOF
 {

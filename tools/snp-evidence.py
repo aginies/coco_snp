@@ -151,13 +151,70 @@ def parse_report(r):
     return {"attestation_report": fields}
 
 
+def processor_generation(fam, mod):
+    # Mirrors trustee deps/verifier/src/snp/mod.rs get_processor_generation().
+    if fam == 0x19:
+        if mod <= 0x0F:
+            return "Milan"
+        if 0x10 <= mod <= 0x1F or 0xA0 <= mod < 0xAF:
+            return "Genoa"
+    elif fam == 0x1A and mod <= 0x11:
+        return "Turin"
+    raise SystemExit(
+        f"unsupported processor (cpuid family 0x{fam:x} model 0x{mod:x})")
+
+
+def vcek_params(r):
+    """Return the VCEK lookup keys for a raw report.
+
+    Same derivation as the trustee 0.23 snp_verifier (fetch_vcek_from_kds /
+    fetch_vcek_from_offline_store), so the host can fetch the VCEK from AMD
+    KDS and drop it where CoCo-AS's OfflineStore source looks for it:
+        <store>/vcek/<hw_id>/<tcb_prefix>_vcek.der
+    """
+    ev = parse_report(r)["attestation_report"]
+    fam, mod = ev["cpuid_fam_id"], ev["cpuid_mod_id"]
+    if fam is None:
+        raise SystemExit("report version 2 has no CPUID: cannot pick the "
+                         "processor generation (need report v3+)")
+    gen = processor_generation(fam, mod)
+    chip_id = bytes(ev["chip_id"])
+    if chip_id == bytes(64):
+        raise SystemExit("chip_id is all zeros (MASK_CHIP_ID set?): "
+                         "cannot look up the VCEK")
+    # reported_tcb raw bytes: Turin uses [fmc, bl, tee, snp, 0, 0, 0, ucode],
+    # Milan/Genoa [bl, tee, 0, 0, 0, 0, snp, ucode].
+    t = r[0x180:0x188]
+    if gen == "Turin":
+        hw_id = chip_id[:8].hex()
+        fmc, bl, tee, snp, ucode = t[0], t[1], t[2], t[3], t[7]
+        prefix = f"bl{bl:02}_tee{tee:02}_snp{snp:02}_ucode{ucode:02}_fmc{fmc:02}"
+        query = (f"fmcSPL={fmc:02}&blSPL={bl:02}&teeSPL={tee:02}"
+                 f"&snpSPL={snp:02}&ucodeSPL={ucode:02}")
+    else:
+        hw_id = chip_id.hex()
+        bl, tee, snp, ucode = t[0], t[1], t[6], t[7]
+        prefix = f"bl{bl:02}_tee{tee:02}_snp{snp:02}_ucode{ucode:02}"
+        query = f"blSPL={bl:02}&teeSPL={tee:02}&snpSPL={snp:02}&ucodeSPL={ucode:02}"
+    return gen, hw_id, prefix, query
+
+
 def main(argv):
-    if len(argv) > 1:
-        b64 = argv[1].encode()
+    params = False
+    args = argv[1:]
+    if args and args[0] == "--vcek-params":
+        # Print "<gen> <hw_id> <tcb_prefix> <kds_query>" instead of evidence.
+        params = True
+        args = args[1:]
+    if args:
+        b64 = args[0].encode()
     else:
         b64 = sys.stdin.buffer.read()
     b64 = b64.strip()
     raw = base64.b64decode(b64)          # standard base64 of the raw report
+    if params:
+        sys.stdout.write(" ".join(vcek_params(raw)) + "\n")
+        return 0
     evidence = parse_report(raw)
     text = json.dumps(evidence, separators=(",", ":"))
     # proto `bytes` field: base64 URL-safe, NO padding.

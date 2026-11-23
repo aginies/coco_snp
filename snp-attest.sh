@@ -29,6 +29,7 @@
 # Commands (host, act inside SNP guest over ssh):
 #   setup-guest    Inside guest (or via ssh): install snpguest, generate report
 #   attest         Remote attestation: report -> CoCo-AS -> EAR token
+#   vcek-fetch     Fetch the guest platform VCEK into the CoCo-AS store
 #   secret-get     Fetch a KBS secret from inside the SNP guest
 #
 # Collateral source (--collateral):
@@ -205,6 +206,7 @@ commands are tagged with the target). Use -q to show errors only.
 === GUEST (run on host, acts inside the SNP VM over ssh) ===
   setup-guest      Install guest libs, verify SNP VM, generate a report
   attest           Remote attestation: report -> CoCo-AS -> EAR token
+  vcek-fetch       Fetch the guest's VCEK (KDS, via curl) into the CoCo-AS store
   register-rv      Enroll guest identity into RVPS
   query-rv         Query an RVPS reference value
   secret-set       Store a secret in KBS (admin)
@@ -495,6 +497,10 @@ parse_args() {
     attest)
         init_debug
         cmd_attest
+        ;;
+    vcek-fetch)
+        init_debug
+        cmd_vcek_fetch
         ;;
     register-rv | rvps-register)
         init_debug

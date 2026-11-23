@@ -1,6 +1,6 @@
 # AMD SEV-SNP Attestation — Step-by-Step Guide
 
-Version 1.0.3
+Version 1.0.4
 
 A guided walkthrough of how to set up and run AMD SEV-SNP attestation using
 `snp-attest.sh`. The installation layer is distribution-pluggable (`lib/distros/`),
@@ -41,7 +41,7 @@ This gives you the full history, all branches, and the ability to update with
 **Option 2 — Download a specific release tarball:**
 
 ```bash
-VERSION="1.0.3"
+VERSION="1.0.4"
 curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
 tar xzf coco_snp-${VERSION}.tar.gz
 cd coco_snp-${VERSION}
@@ -54,9 +54,9 @@ and documentation — ready to use without Git.
 
 ```bash
 # Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.3.tar.gz"
-tar xzf v1.0.3.tar.gz
-cd coco_snp-1.0.3
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.4.tar.gz"
+tar xzf v1.0.4.tar.gz
+cd coco_snp-1.0.4
 ```
 
 ---
@@ -119,9 +119,13 @@ sudo ./snp-attest.sh secret-get --guest-ip <GUEST_IP> --path default/test/secret
    (Method A), or the host fetches the report over SSH and submits it to
    CoCo-AS with `grpcurl` (the `attest` command / Method B).
 3. **Host:** KBS delegates report verification to CoCo-AS.
-4. **Host:** CoCo-AS fetches the **ARK → ASK → VCEK** chain from **AMD KDS**
-   (remote) — or from the local offline certificate store when run with
-   `--collateral offline`.
+4. **Host:** CoCo-AS takes the **ARK → ASK** certificates built into its
+   verifier and reads the **VCEK** from its local store
+   (`/var/lib/attestation-service/kds-store`). The script fills that store from
+   **AMD KDS** with `curl` on the host, or from the `--collateral offline`
+   certificate store. CoCo-AS itself makes no outbound KDS call (trustee 0.23
+   workaround, see
+   [TRUSTEE-0.23-GRPC-AS-PANIC.md](TRUSTEE-0.23-GRPC-AS-PANIC.md)).
 5. **Host:** CoCo-AS verifies the report signature against the VCEK, checks
    the reported TCB against KDS, and compares the launch identity
    (`id_block`, `id_auth`, `launch_digest`) against reference values from RVPS,
@@ -397,6 +401,9 @@ sudo ./snp-attest.sh setup-trustee
 6. **Writes the three config files:**
    - `/etc/grpc-as.json` → CoCo-AS: storage dir, signer key, and the
      **`snp_verifier`** (so it appraises SEV-SNP reports, not TDX quotes).
+     The verifier gets a single **`OfflineStore`** VCEK source
+     (`/var/lib/attestation-service/kds-store`); the script fills it from AMD
+     KDS on the host (see the trustee 0.23 note below).
    - `/etc/kbs.json` → KBS: listen address, CoCo-AS address, JWKS file,
      policy path. (Lab settings: `insecure_http`, `InsecureAllowAll`.)
    - `/etc/rvps.json` → RVPS: storage dir.
@@ -428,6 +435,28 @@ sudo ./snp-attest.sh setup-trustee
 systemctl is-active grpc-as kbs rvps           # all active
 ss -tln | grep -E '3000|8080'                  # ports listening
 ```
+
+> **Note — trustee 0.23 VCEK source:** with its default `KDS` VCEK source,
+> trustee 0.23 builds an HTTPS client inside `grpc-as`. On SLES 16.1 that
+> client fails to initialise, and `grpc-as` panics on every attestation request
+> (`Client::new(): reqwest::Error { kind: Builder ... }`). 0.23 also silently
+> ignores the `collateral_service` / `local_collateral_path` keys that older
+> versions of this script wrote. So `setup-trustee` now writes:
+>
+> ```json
+> "snp_verifier": {
+>   "vcek_sources": [
+>     { "type": "OfflineStore", "path": "/var/lib/attestation-service/kds-store" }
+>   ]
+> }
+> ```
+>
+> `attest`, `secret-get` and `vcek-fetch` fetch the VCEK for each report from
+> AMD KDS with `curl` on the host and store it as
+> `kds-store/vcek/<hw_id>/<tcb_prefix>_vcek.der`, so `grpc-as` never makes an
+> outbound call. If you set up Trustee with an older version of this script,
+> re-run `sudo ./snp-attest.sh setup-trustee`. Details:
+> [TRUSTEE-0.23-GRPC-AS-PANIC.md](TRUSTEE-0.23-GRPC-AS-PANIC.md).
 
 > **Note — lab vs production:** this setup is deliberately a **lab
 > configuration**. Three things are permissive and must be changed for real
@@ -690,9 +719,10 @@ ls -la /root/snp-attest/report.dat
 
 This is the end-to-end live attestation: once your SNP guest is running,
 `attest` generates a 4000-byte report (signed in-guest by the CPU's PSP),
-submits it to CoCo-AS, which fetches the ARK/ASK/VCEK chain from AMD KDS and
-verifies the signature, TCB status, and launch identity, then returns an EAR
-token — `affirming` when the platform is valid and reference values are
+makes sure the matching VCEK is in the CoCo-AS store (fetched from AMD KDS on
+the host), and submits the report to CoCo-AS. CoCo-AS checks the
+ARK → ASK → VCEK chain, the signature, TCB status and launch identity, then
+returns an EAR token — `affirming` when the platform is valid and reference values are
 enrolled.
 
 **Command (on the host):**
@@ -718,8 +748,13 @@ sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv
    - *Why fresh:* the report's `report_data` is a per-run nonce; a reused
      report is rejected.
 
-2. **Fetches the report** (the raw 4000 bytes) and **wraps it as CoCo-AS
-   evidence**. The raw bytes are base64-encoded, embedded in the CoCo-AS
+2. **Fetches the report** (the raw 4000 bytes), **provisions its VCEK** and
+   **wraps it as CoCo-AS evidence**. The VCEK lookup keys (processor
+   generation, chip ID, reported TCB) come from the report
+   (`tools/snp-evidence.py --vcek-params`). If
+   `kds-store/vcek/<hw_id>/<tcb_prefix>_vcek.der` is missing, the script
+   downloads it from KDS with `curl`. If KDS is unreachable, it falls back to
+   `/var/lib/sev-snp/certs/vcek.pem` as the flat `vcek.der`. The raw bytes are base64-encoded, embedded in the CoCo-AS
    `SnpEvidence` JSON structure (`{ "attestation_report": "<base64>" }`), and
    the whole object is then base64url-encoded into the `evidence` field.
    - *Why the JSON wrapper:* the CoCo-AS `snp_verifier` base64-URL-decodes the
@@ -775,8 +810,8 @@ sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv
      …) is used if present, otherwise the script writes one to
      `/tmp/trustee-protos/`. `snp-attest.sh` automatically installs prebuilt
      `grpcurl` into `/usr/local/bin` (or `~/.local/bin`) if missing.
-   - *What CoCo-AS does with it:* verifies the VCEK signature, fetches the
-     ARK/ASK/VCEK chain from AMD KDS (or the local offline store), checks the
+   - *What CoCo-AS does with it:* verifies the VCEK signature, reading the
+     VCEK from its offline store (ARK/ASK are built into the verifier), checks the
      reported TCB, compares the launch identity (`id_block`, `id_auth`,
      `launch_digest`) against RVPS reference values, then returns an **EAR
      token** — a JWT containing all measured claims plus an `allow: true/false`
@@ -794,12 +829,22 @@ tokens" at the end of this guide.)*
 
 The `attest` command decodes the EAR token (a JWT built on EAT, RFC 9711):
 extracts the payload, formats the claims, displays a structured verification
-report, and checks `ear.status` together with the AMD KDS hardware
-trustworthiness vector (`ear.trustworthiness-vector.hardware`, 0–100 — this
-build of the annotated evidence has no `submods.cpu0.tcb_status`, so KDS
-verification is read from there). The grpcurl appraisal call is retried
-(up to 4× with a 5 s backoff) to ride out transient AMD KDS VCEK-fetch
-failures, which are common on the back-to-back re-evaluation.
+report, and checks the EAR status together with the hardware
+trustworthiness vector (0–100). There is no `submods.cpu0.tcb_status` for SNP,
+so hardware verification is read from the vector. Both EAR claim layouts are
+parsed:
+
+| trustee <= 0.22 | trustee >= 0.23 (EAR draft-04) |
+| --- | --- |
+| `submods.cpu0."ear.status"` | `submods.cpu0.ear_status` |
+| `"ear.trustworthiness-vector"` | `ear_trustworthiness_vector` |
+| `"ear.veraison.annotated-evidence".snp.*` | `ear_attester_claims.claims.*` |
+
+A custom KBS resource policy that reads `ear.status` must switch to
+`ear_status` on 0.23. The grpcurl appraisal call is retried (up to 4× with a
+5 s backoff). If it still fails, the script prints the `grpc-as` log without
+backtrace frames and a hint for known errors (trustee 0.23 `Client::new()`
+panic, poisoned `LazyLock`, missing VCEK).
 
 **Expected output (report verified, awaiting RVPS enrollment):**
 
@@ -888,7 +933,8 @@ journalctl -u grpc-as.service -n 50     # CoCo-AS logs: why it rejected
 ```
 
 Common causes: RVPS reference values don't match the guest's launch identity,
-reported TCB outdated, AMD KDS / offline store unreachable.
+reported TCB outdated, no VCEK in the CoCo-AS store (`sudo ./snp-attest.sh
+vcek-fetch --guest-ip <GUEST_IP>`).
 
 ---
 
@@ -1079,6 +1125,15 @@ sudo ./snp-attest.sh setup-vm --guest-iso /path/to/SLE-16.1.iso --collateral off
 > read the local store. `setup-vm` doesn't directly use the flag but benefits
 > from the host being configured.
 
+> **CoCo-AS VCEK store:** in every mode CoCo-AS reads the VCEK from
+> `/var/lib/attestation-service/kds-store` (trustee 0.23 workaround). Offline,
+> `attest` cannot download the per-TCB VCEK, so it copies
+> `/var/lib/sev-snp/certs/vcek.pem` there as `vcek/<hw_id>/vcek.der`. That
+> works while the guest's reported TCB matches the TCB the VCEK was fetched
+> for. You can also copy a DER VCEK to
+> `kds-store/vcek/<hw_id>/<tcb_prefix>_vcek.der` yourself. The script prints the
+> exact path and KDS URL when it is missing.
+
 #### 5. Complete the remaining steps (5–10) as usual
 
 Steps 5–10 (guest OS install, guest setup, attestation, secret delivery,
@@ -1156,6 +1211,9 @@ was verified" — that's why the script can use it as a bearer token in Step 8.
 | `snpguest report`: "Failed to get the report" | `/dev/sev-guest` not present or GHCB not set up | Confirm the VM is a real SNP guest (Step 6 item 3); check the guest kernel has the `sev-guest` driver |
 | Attestation: `ear.status: contraindicated` | RVPS values missing (fresh RVPS) or mismatched | Run `sudo ./snp-attest.sh attest --guest-ip <GUEST_IP> --register-rv` to enroll the current identity, or check `journalctl -u grpc-as.service -n 50`. Note: once values are enrolled they **persist** in RVPS, so a plain `attest` already returns `affirming` — `contraindicated` means the store is empty or the guest's launch identity changed. |
 | Attestation: `ear.status: warning` (TCB OutOfDate) | Reported TCB older than KDS's current TCB | Update guest microcode/BIOS, or refresh the KDS cache / offline store |
+| `attest`: `Code: Canceled ... RST_STREAM with error code: CANCEL`; `grpc-as` log: `panicked at ... Client::new(): reqwest::Error { kind: Builder ...}` | trustee 0.23 KDS VCEK source: the in-process HTTPS client fails to initialise on SLES 16.1 | `sudo ./snp-attest.sh setup-trustee` (switches to the `OfflineStore` VCEK source), then `attest`. See [TRUSTEE-0.23-GRPC-AS-PANIC.md](TRUSTEE-0.23-GRPC-AS-PANIC.md) |
+| `grpc-as` log: `Failed to fetch VCEK from any configured source` | No VCEK for this chip / TCB in `/var/lib/attestation-service/kds-store` | `sudo ./snp-attest.sh vcek-fetch --guest-ip <GUEST_IP>` (needs KDS access, or `/var/lib/sev-snp/certs/vcek.pem`) |
+| `attest` shows `EAR Status: Unknown` with an old copy of the script | trustee 0.23 renamed EAR claims (`ear.status` → `ear_status`) | Update the scripts; both layouts are parsed |
 | CoCo-AS: "unknown TEE" / verifier error | CoCo-AS not using `snp_verifier` | `sudo ./snp-attest.sh setup-trustee` (rewrites `grpc-as.json` with `snp_verifier`); or `verify` → CoCo-AS rows |
 | KBS rejects tokens: `neither trusted jwk set nor trusted pem public key works` | Token header embeds a `jwk` but the `x5c` chain is empty or doesn't chain to `trusted_certs_paths` | `sudo ./snp-attest.sh setup-trustee` (regenerates `/etc/trustee/as-signer.crt`, `grpc-as.json` `cert_path`, `kbs.json` `trusted_certs_paths`); or `verify` → JWKS rows |
 | `trustee.service` reports `inactive` / condition failed | The monolithic `trustee.service` is intentionally disabled in favor of individual modular units | Expected behavior. Verify the active modular services: `systemctl is-active grpc-as kbs rvps` |

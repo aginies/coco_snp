@@ -43,6 +43,178 @@ snp_evidence_from_b64() {
         | python3 "${SCRIPT_DIR}/tools/snp-evidence.py"
 }
 
+# --- CoCo-AS offline VCEK store (trustee >= 0.23 workaround) -----------------
+#
+# Trustee 0.23's snp_verifier KDS source builds a reqwest HTTPS client inside
+# grpc-as; on SLES 16.1 that panics on every request (see
+# TRUSTEE-0.23-GRPC-AS-PANIC.md). setup-trustee therefore configures only the
+# "OfflineStore" VCEK source, and the host fills the store itself: for each
+# report, ensure_as_vcek derives the processor generation, hardware ID and
+# reported TCB (tools/snp-evidence.py --vcek-params), and if the matching
+# <store>/vcek/<hw_id>/<tcb_prefix>_vcek.der is missing it fetches the VCEK
+# from AMD KDS with curl (system OpenSSL works fine in curl). If KDS cannot be
+# reached it falls back to the snphost store (${SNP_VCEK_CERT}) as the flat
+# <store>/vcek/<hw_id>/vcek.der.
+
+# Create the store root, owned by the CoCo-AS service account.
+prepare_as_kds_store() {
+    mkdir -p "${AS_KDS_STORE}/vcek"
+    if id coco_as >/dev/null 2>&1; then
+        chown -R coco_as:coco_as "$AS_KDS_STORE"
+    fi
+    chmod 0755 "$AS_KDS_STORE" "${AS_KDS_STORE}/vcek"
+}
+
+# True when the CoCo-AS config uses the OfflineStore VCEK source.
+as_uses_offline_store() {
+    [[ -r "$GRPC_AS_CONF" ]] && grep -q '"OfflineStore"' "$GRPC_AS_CONF"
+}
+
+# Install a DER VCEK into the store (atomic, readable by coco_as).
+install_as_vcek() {
+    local src="$1" dst="$2"
+    local dir
+    dir=$(dirname "$dst")
+    mkdir -p "$dir"
+    install -m 0644 "$src" "${dst}.tmp"
+    mv -f "${dst}.tmp" "$dst"
+    if id coco_as >/dev/null 2>&1; then
+        chown coco_as:coco_as "$dir" "$dst"
+        chown coco_as:coco_as "$(dirname "$dir")" 2>/dev/null || true
+    fi
+}
+
+# Make sure CoCo-AS can find the VCEK that signed the given report (base64).
+# No-op when grpc-as is not configured with the OfflineStore source.
+# Returns 0 when the VCEK is in the store, 1 otherwise (with a warning).
+ensure_as_vcek() {
+    local report_b64="$1"
+    as_uses_offline_store || return 0
+    require_cmd python3 openssl curl
+
+    local params gen hw_id prefix query
+    if ! params=$(printf '%s' "$report_b64" | python3 "${SCRIPT_DIR}/tools/snp-evidence.py" --vcek-params); then
+        warn "Could not derive the VCEK lookup keys from the report."
+        return 1
+    fi
+    read -r gen hw_id prefix query <<<"$params"
+
+    local dir="${AS_KDS_STORE}/vcek/${hw_id}"
+    local dst="${dir}/${prefix}_vcek.der"
+    if [[ -s "$dst" ]]; then
+        log "VCEK already in CoCo-AS store: ${dst#"${AS_KDS_STORE}"/}"
+        return 0
+    fi
+    [[ -d "$AS_KDS_STORE" ]] || prepare_as_kds_store 2>/dev/null || true
+    if [[ ! -w "$AS_KDS_STORE" ]]; then
+        warn "VCEK for ${gen} ${prefix} missing from ${AS_KDS_STORE} and it is not writable."
+        warn "Re-run as root (sudo) so the VCEK can be fetched into the store."
+        return 1
+    fi
+
+    local tmp url curl_opts=(-sS -f --max-time 30 --retry 3 --retry-delay 5)
+    [[ "$USE_SECURE_CERT" == "false" ]] && curl_opts+=(-k)
+    tmp=$(mktemp /tmp/snp-vcek.XXXXXX)
+    url="${KDS_URL%/}/${gen}/${hw_id}?${query}"
+    log "Fetching VCEK for CoCo-AS from KDS (${gen}, ${prefix})"
+    if run curl "${curl_opts[@]}" -o "$tmp" "$url" &&
+        openssl x509 -inform der -in "$tmp" -noout 2>/dev/null; then
+        install_as_vcek "$tmp" "$dst"
+        rm -f "$tmp"
+        log "VCEK stored: ${dst}"
+        return 0
+    fi
+    rm -f "$tmp"
+
+    # KDS unreachable (air-gapped / offline collateral): reuse the snphost
+    # store VCEK as the flat fallback. It matches the report only if the
+    # report's reported TCB equals the TCB the store VCEK was fetched for.
+    local flat="${dir}/vcek.der"
+    if [[ -s "$SNP_VCEK_CERT" ]]; then
+        tmp=$(mktemp /tmp/snp-vcek.XXXXXX)
+        if openssl x509 -in "$SNP_VCEK_CERT" -outform der -out "$tmp" 2>/dev/null; then
+            install_as_vcek "$tmp" "$flat"
+            rm -f "$tmp"
+            warn "KDS not reachable; using ${SNP_VCEK_CERT} as ${flat}."
+            warn "It verifies this report only if it was fetched for TCB ${prefix}; refresh it ('snphost fetch vcek') after TCB updates."
+            return 0
+        fi
+        rm -f "$tmp"
+    fi
+    if [[ -s "$flat" ]]; then
+        warn "KDS not reachable; CoCo-AS will try the existing flat ${flat}."
+        return 0
+    fi
+    warn "No VCEK for ${gen} ${prefix} (hw_id ${hw_id:0:16}...): KDS fetch failed and ${SNP_VCEK_CERT} is absent."
+    warn "Copy the DER VCEK to ${dst} (from a machine with KDS access: ${url})."
+    return 1
+}
+
+# Fetch a fresh report from the guest and make sure its VCEK is in the
+# CoCo-AS store. Used before flows where the report never passes through this
+# script (in-guest kbs-client -> KBS -> CoCo-AS). No-op without OfflineStore.
+prime_as_vcek_from_guest() {
+    as_uses_offline_store || return 0
+    log "Priming CoCo-AS VCEK store from a fresh guest report"
+    guest_generate_report || return 1
+    local report_b64
+    report_b64=$(ssh_guest "base64 -w0 ${GUEST_WORKDIR}/report.dat") || return 1
+    [[ -n "$report_b64" ]] || return 1
+    ensure_as_vcek "$report_b64"
+}
+
+# vcek-fetch: provision the CoCo-AS offline VCEK store for the guest's platform
+# and current reported TCB. Re-run after a host firmware / microcode (TCB)
+# update; 'attest' and 'secret-get' also do it automatically.
+cmd_vcek_fetch() {
+    require_root
+    detect_guest_ip
+    log "=== Provision CoCo-AS VCEK store (${AS_KDS_STORE}) from guest ${GUEST_IP} ==="
+    step "Fetch the VCEK matching the guest report into the CoCo-AS offline store" \
+        "Reads chip ID + reported TCB from a fresh guest report, downloads the VCEK from AMD KDS on the host (curl), and stores it where the snp_verifier OfflineStore source looks. Avoids the trustee 0.23 in-process HTTPS client panic."
+    as_uses_offline_store ||
+        die "${GRPC_AS_CONF} does not use the OfflineStore VCEK source. Re-run 'setup-trustee' first."
+    prime_as_vcek_from_guest || die "Could not provision the VCEK for this guest (see warnings above)."
+    log "CoCo-AS VCEK store content:"
+    find "${AS_KDS_STORE}/vcek" -type f -name '*.der' -printf '  %P\n' 2>/dev/null || true
+}
+
+# Pre-flight before talking to CoCo-AS: report a stopped/crashed grpc-as
+# clearly instead of a bare grpcurl "connection refused".
+as_preflight() {
+    local port="${COCO_AS##*:}"
+    if systemctl list-unit-files grpc-as.service >/dev/null 2>&1 &&
+        ! systemctl is-active --quiet grpc-as.service; then
+        error "grpc-as.service is not active ($(systemctl is-active grpc-as.service 2>/dev/null || true))."
+        as_log_hints
+        die "Start it: systemctl restart grpc-as.service"
+    fi
+    if command -v ss >/dev/null 2>&1 && [[ "${COCO_AS%%:*}" =~ ^(127\.0\.0\.1|localhost)$ ]] &&
+        ! ss -ltn "sport = :${port}" 2>/dev/null | grep -q LISTEN; then
+        warn "Nothing listens on CoCo-AS port ${port} yet."
+    fi
+}
+
+# Dump recent grpc-as log lines without Rust backtrace frames (so the
+# 'panicked at' line stays visible) and print a hint for known failures.
+as_log_hints() {
+    local logs
+    logs=$(journalctl -u grpc-as.service -n 200 --no-pager 2>/dev/null |
+        grep -vE '^\s*[0-9]+: |^\s+at ' | tail -n 30 || true)
+    [[ -n "$logs" ]] || return 0
+    error "=== CoCo-AS logs (journalctl -u grpc-as.service, backtrace frames dropped) ==="
+    echo "$logs" >&2
+    if grep -q 'Client::new()' <<<"$logs"; then
+        error "grpc-as panicked building its HTTPS client (trustee 0.23 KDS VCEK source)."
+        error "Re-run 'setup-trustee' so CoCo-AS uses the OfflineStore VCEK source,"
+        error "then 'vcek-fetch' / 'attest' (see TRUSTEE-0.23-GRPC-AS-PANIC.md)."
+    elif grep -q 'previously been poisoned' <<<"$logs"; then
+        error "grpc-as is in a poisoned state after an earlier panic: systemctl restart grpc-as.service"
+    elif grep -q 'Failed to fetch VCEK' <<<"$logs"; then
+        error "CoCo-AS found no VCEK in ${AS_KDS_STORE}: run 'snp-attest.sh vcek-fetch' as root."
+    fi
+}
+
 attest_evaluate_report() {
     local report_b64="$1"
     local runtime_data_json="${2:-}"
@@ -51,6 +223,9 @@ attest_evaluate_report() {
     ensure_attestation_proto
 
     [[ -n "$report_b64" ]] || die "Empty report passed to attest_evaluate_report"
+    as_preflight
+    ensure_as_vcek "$report_b64" ||
+        warn "CoCo-AS may fail to verify this report (no VCEK in ${AS_KDS_STORE})."
 
     log "Building attestation request JSON (Trustee 0.20 format, SNP)"
     # evidence must be the base64url (no-pad) JSON of the parsed report, not
@@ -84,9 +259,9 @@ EOF
 
     local response="" attempt=0 max_attempts=4
     log "Sending request via grpcurl to ${COCO_AS}"
-    # AMD KDS is intermittently unavailable: a VCEK fetch can fail transiently,
-    # especially for the back-to-back re-evaluation done by --register-rv.
-    # Retry a few times with a short backoff instead of failing immediately.
+    # Retry a few times with a short backoff: with a KDS VCEK source (trustee
+    # 0.22) a VCEK fetch can fail transiently, especially for the back-to-back
+    # re-evaluation done by --register-rv.
     while ((attempt < max_attempts)); do
         attempt=$((attempt + 1))
         response=$(grpcurl -plaintext \
@@ -95,15 +270,14 @@ EOF
             -d @ \
             "${COCO_AS}" attestation.AttestationService/AttestationEvaluate <"$req_file" 2>&1) \
             && break
-        warn "grpcurl attempt ${attempt}/${max_attempts} failed; retrying (AMD KDS may be transiently unavailable):"
+        warn "grpcurl attempt ${attempt}/${max_attempts} failed; retrying:"
         echo "$response" | tail -2 >&2
         sleep 5
     done
     if ! printf '%s' "$response" | grep -q '"attestationToken"'; then
         rm -f "$req_file"
         echo "" >&2
-        error "=== CoCo-AS logs (journalctl -u grpc-as.service -n 30) ==="
-        journalctl -u grpc-as.service -n 30 --no-pager >&2 2>/dev/null || true
+        as_log_hints
         die "Attestation request failed after ${attempt} attempt(s)."
     fi
     rm -f "$req_file"
@@ -202,12 +376,13 @@ jwt_decode_payload() {
 # space-separated: ear_status id_block id_auth launch_digest policy vmpl
 # report_id report_id_ma chip_id tcb_status
 snp_ear_fields() {
-    # Reads the flat SNP annotated-evidence structure produced by the Trustee
-    # 0.22.0 snp_verifier: the fields live directly under
-    #   submods.cpu0.ear.veraison.annotated-evidence.snp
+    # Reads the flat SNP claims produced by the Trustee snp_verifier: the
+    # fields live directly under
+    #   submods.cpu0.ear_attester_claims.claims               (trustee >= 0.23)
+    #   submods.cpu0."ear.veraison.annotated-evidence".snp    (trustee <= 0.22)
     # (chip_id, measurement, reported_tcb_*), NOT nested under a 'report'
     # key, and there is NO 'tcb_status' field — AMD KDS verification is
-    # signalled by ear.trustworthiness-vector.hardware (0..100).
+    # signalled by the trustworthiness vector "hardware" claim (0..100).
     # Output is '|' delimited (not whitespace): empty fields are preserved and
     # values may contain spaces (e.g. the TCB status text), so `read` cannot
     # shift the columns.
@@ -222,11 +397,14 @@ import sys, json
 try:
     d = json.loads(sys.stdin.read())
     submod = d.get('submods', {}).get('cpu0', {})
-    ear_status = submod.get('ear.status', '')
-    evidence = submod.get('ear.veraison.annotated-evidence', {})
-    snp = evidence.get('snp', {})
+    # trustee >= 0.23 (EAR draft-04): ear_status, ear_trustworthiness_vector,
+    # ear_attester_claims.claims; <= 0.22: dotted names + annotated-evidence.snp
+    ear_status = submod.get('ear_status') or submod.get('ear.status', '')
+    snp = (submod.get('ear_attester_claims', {}).get('claims')
+           or submod.get('ear.veraison.annotated-evidence', {}).get('snp', {}))
     chip_id = snp.get('chip_id', '')
-    tw = submod.get('ear.trustworthiness-vector', {})
+    tw = (submod.get('ear_trustworthiness_vector')
+          or submod.get('ear.trustworthiness-vector', {}))
     hardware_tw = tw.get('hardware', '')
     if str(hardware_tw) not in ('', 'None') and int(hardware_tw) >= 50:
         tcb_status = 'Verified (hardware trustworthiness %s%%)' % hardware_tw
@@ -256,7 +434,10 @@ snp_rv_sample() {
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
-    snp = d['submods']['cpu0']['ear.veraison.annotated-evidence']['snp']
+    cpu0 = d['submods']['cpu0']
+    # trustee >= 0.23: ear_attester_claims.claims; <= 0.22: annotated-evidence.snp
+    snp = (cpu0.get('ear_attester_claims', {}).get('claims')
+           or cpu0['ear.veraison.annotated-evidence']['snp'])
     rv = {
         'snp_launch_measurement': [snp['measurement']],
         'snp_bootloader': [snp['reported_tcb_bootloader']],
@@ -395,7 +576,7 @@ cmd_attest() {
         IFS='|' read -r ear_status id_block id_auth launch_digest policy vmpl report_id _ chip_id tcb_status <<<"$fields"
     fi
     if [[ -z "$ear_status" ]]; then
-        ear_status=$(echo "$jwt_json" | grep -oP '"ear\.status"\s*:\s*"\K[^"]+' | head -n1 || true)
+        ear_status=$(echo "$jwt_json" | grep -oP '"ear[._]status"\s*:\s*"\K[^"]+' | head -n1 || true)
     fi
     if [[ -z "$tcb_status" ]]; then
         tcb_status=$(echo "$jwt_json" | grep -oP '"tcb_status"\s*:\s*"\K[^"]+' | head -n1 || true)
@@ -438,12 +619,13 @@ cmd_attest() {
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
-    print(d.get('submods', {}).get('cpu0', {}).get('ear.status', ''))
+    c = d.get('submods', {}).get('cpu0', {})
+    print(c.get('ear_status') or c.get('ear.status', ''))
 except Exception:
     pass
 " <<<"$jwt_json")
             else
-                ear_status=$(echo "$jwt_json" | grep -oP '"ear\.status"\s*:\s*"\K[^"]+' | head -n1 || true)
+                ear_status=$(echo "$jwt_json" | grep -oP '"ear[._]status"\s*:\s*"\K[^"]+' | head -n1 || true)
             fi
         fi
     fi

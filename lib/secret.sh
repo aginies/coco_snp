@@ -157,6 +157,12 @@ PYEOF
     kbs_client_supports_snp_guest "$kbs_bin" ||
         die "Guest kbs-client (${kbs_bin}) has no SNP attester. Upgrade the guest 'trustee' package and re-run setup-guest."
 
+    # The guest report goes kbs-client -> KBS -> CoCo-AS without passing
+    # through this script, so put its VCEK in the CoCo-AS store first
+    # (trustee 0.23 OfflineStore source, see ensure_as_vcek).
+    prime_as_vcek_from_guest ||
+        warn "Could not prime the CoCo-AS VCEK store; attestation may fail."
+
     local out
     if [[ -n "$SECRET_FILE" ]]; then
         log "Saving secret to (guest path): ${SECRET_FILE}"

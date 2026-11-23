@@ -594,6 +594,33 @@ verify_vm_snp() {
     fi
 }
 
+# trustee >= 0.23 reads only snp_verifier.vcek_sources; the KDS source panics
+# grpc-as on SLES 16.1 (TRUSTEE-0.23-GRPC-AS-PANIC.md), so setup-trustee writes
+# an OfflineStore source and the script fills ${AS_KDS_STORE}.
+verify_as_vcek_source() {
+    [[ -r "$GRPC_AS_CONF" ]] || return 0
+    if ! grep -q '"vcek_sources"' "$GRPC_AS_CONF"; then
+        record "FAIL" "CoCo-AS snp_verifier has no vcek_sources (pre-0.23 config)" \
+            "trustee 0.23 ignores collateral_service and uses KDS in-process (panics): re-run setup-trustee"
+        return
+    fi
+    if grep -q '"OfflineStore"' "$GRPC_AS_CONF"; then
+        record "PASS" "CoCo-AS VCEK source: OfflineStore (${AS_KDS_STORE})"
+    else
+        record "WARN" "CoCo-AS VCEK source is not OfflineStore" \
+            "KDS source panics grpc-as with trustee 0.23 on SLES 16.1: re-run setup-trustee"
+        return
+    fi
+    local n
+    n=$(find "${AS_KDS_STORE}/vcek" -type f -name '*.der' 2>/dev/null | wc -l)
+    if ((n > 0)); then
+        record "PASS" "CoCo-AS VCEK store populated (${n} VCEK file(s))"
+    else
+        record "WARN" "CoCo-AS VCEK store empty: ${AS_KDS_STORE}/vcek" \
+            "Filled on first 'attest'; or run: sudo snp-attest.sh vcek-fetch --guest-ip <IP>"
+    fi
+}
+
 cmd_verify() {
     log "=== Verifying attestation configuration ==="
     step "Double-check every config written by the setup steps is correct" \
@@ -608,6 +635,7 @@ cmd_verify() {
     # --- Config content is consistent ---
     verify_conf_contains "CoCo-AS SNP verifier" "$GRPC_AS_CONF" '"snp_verifier"' \
         "CoCo-AS must use the snp_verifier for SEV-SNP reports"
+    verify_as_vcek_source
     verify_kbs_as_addr
 
     # --- Secret delivery (KBS) plumbing ---

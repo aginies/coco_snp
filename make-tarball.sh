@@ -41,6 +41,7 @@ mkdir -p "${STAGING_TAR}"
 # Copy files into versioned staging directory
 cp -a "${SCRIPT_DIR}/README.md" "${SCRIPT_DIR}/LICENSE" \
 	"${SCRIPT_DIR}/MEMO.md" \
+	"${SCRIPT_DIR}/TRUSTEE-0.23-GRPC-AS-PANIC.md" \
 	"${SCRIPT_DIR}/snp-attest.sh" \
 	"${SCRIPT_DIR}/convert_doc.py" \
 	"${SCRIPT_DIR}"/amd-attestation* \
