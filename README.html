@@ -31,7 +31,7 @@
 
 <header class="hero">
   <h1>AMD SEV-SNP Attestation — Step-by-Step Guide</h1>
-  <p>Version 1.0.2</p>
+  <p>Version 1.0.3</p>
 </header>
 
 
@@ -59,16 +59,16 @@
 cd coco_snp</pre>
 <p>This gives you the full history, all branches, and the ability to update with <code>git pull</code>.</p>
 <p class="caption"><strong>Option 2 — Download a specific release tarball:</strong></p>
-<pre>VERSION="1.0.2"
+<pre>VERSION="1.0.3"
 curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
 tar xzf coco_snp-${VERSION}.tar.gz
 cd coco_snp-${VERSION}</pre>
 <p>The tarball contains a versioned subdirectory with all scripts, the library, and documentation — ready to use without Git.</p>
 <p class="caption"><strong>Option 3 — Download a single branch or tag:</strong></p>
 <pre># Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.2.tar.gz"
-tar xzf v1.0.2.tar.gz
-cd coco_snp-1.0.2</pre>
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.3.tar.gz"
+tar xzf v1.0.3.tar.gz
+cd coco_snp-1.0.3</pre>
 <hr>
 <h2 id="quick-start--11-commands-on-a-ready-host">Quick Start — 11 commands on a ready host</h2>
 <p><strong>Goal in one sentence:</strong> prove to a remote verifier that the guest is a genuine, untampered SEV-SNP confidential VM, and only then hand it a secret.</p>
@@ -168,7 +168,11 @@ sudo ./snp-attest.sh secret-get --guest-ip &lt;GUEST_IP&gt; --path default/test/
 <table>
   <tr><th>Item</th><th>Where to get it</th><th>Needed for</th></tr>
   <tr><td>SLES 16.1 installer ISO</td><td>SUSE Customer Center (subscription)</td><td><code>setup-vm</code> / <code>all</code> (<code>--guest-iso</code>) and the manual install in Step 5</td></tr>
+  <tr><td>SUSE Package Hub 16.1 (module)</td><td><code>sudo suseconnect -p PackageHub/16.1/x86_64</code> (needs a valid SLES subscription; list available modules with <code>suseconnect -l</code>)</td><td>Every SLES 16.1 system that uses the Virtualization:SGX OBS repository — the host for the Step 2 "latest packages" test, and the guest for Step 7</td></tr>
 </table>
+<div class="callout info">
+  <p><strong>Why PackageHub is required:</strong> the OBS builds depend on libraries that are not in the base SLES repos (e.g. <code>libspdlog.so.1.15</code> for <code>libnvat2</code>), which live in PackageHub; without it <code>zypper dup</code> fails.</p>
+</div>
 <div class="callout info">
   <p><strong>No platform registration needed.</strong> Unlike Intel TDX (Xeon 6 / Scalable platforms must be registered before PCK certificates are issued), SEV-SNP needs <strong>no per-platform registration</strong>. The VCEK is derived from the VM's launch measurement and chained to AMD's public ARK/ASK root — fetched from KDS. If <code>check</code> reports the CPU does not advertise SEV-SNP, the fix is a BIOS setting, not a registration.</p>
 </div>

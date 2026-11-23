@@ -7,7 +7,7 @@
 # shellcheck disable=SC2034,SC2155
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.0.3"
 # SCRIPT_DIR is defined in the main script before sourcing these files.
 
 # Platform check

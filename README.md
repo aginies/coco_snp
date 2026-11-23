@@ -1,6 +1,6 @@
 # AMD SEV-SNP Attestation — Step-by-Step Guide
 
-Version 1.0.2
+Version 1.0.3
 
 A guided walkthrough of how to set up and run AMD SEV-SNP attestation using
 `snp-attest.sh`. The installation layer is distribution-pluggable (`lib/distros/`),
@@ -41,7 +41,7 @@ This gives you the full history, all branches, and the ability to update with
 **Option 2 — Download a specific release tarball:**
 
 ```bash
-VERSION="1.0.2"
+VERSION="1.0.3"
 curl -LO "https://github.com/aginies/coco_snp/releases/download/v${VERSION}/coco_snp-${VERSION}.tar.gz"
 tar xzf coco_snp-${VERSION}.tar.gz
 cd coco_snp-${VERSION}
@@ -54,9 +54,9 @@ and documentation — ready to use without Git.
 
 ```bash
 # Download a specific tag without cloning the full repo
-curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.2.tar.gz"
-tar xzf v1.0.2.tar.gz
-cd coco_snp-1.0.2
+curl -LO "https://github.com/aginies/coco_snp/archive/refs/tags/v1.0.3.tar.gz"
+tar xzf v1.0.3.tar.gz
+cd coco_snp-1.0.3
 ```
 
 ---
@@ -182,6 +182,11 @@ sudo ./snp-attest.sh secret-get --guest-ip <GUEST_IP> --path default/test/secret
 | Item | Where to get it | Needed for |
 | --- | --- | --- |
 | SLES 16.1 installer ISO | SUSE Customer Center (subscription) | `setup-vm` / `all` (`--guest-iso`) and the manual install in Step 5 |
+| SUSE Package Hub 16.1 (module) | `sudo suseconnect -p PackageHub/16.1/x86_64` (needs a valid SLES subscription; list available modules with `suseconnect -l`) | Every SLES 16.1 system that uses the Virtualization:SGX OBS repository — the host for the Step 2 "latest packages" test, and the guest for Step 7 |
+
+> **Why PackageHub is required:** the OBS builds depend on libraries that are
+> not in the base SLES repos (e.g. `libspdlog.so.1.15` for `libnvat2`), which
+> live in PackageHub; without it `zypper dup` fails.
 
 > **No platform registration needed.** Unlike Intel TDX (Xeon 6 / Scalable
 > platforms must be registered before PCK certificates are issued), SEV-SNP
