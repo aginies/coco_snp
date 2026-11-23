@@ -143,10 +143,10 @@ def convert_md_to_html(md_path, html_path):
                                 f'<div class="callout info">\n  <span class="tag">Two sides to this process</span>\n  {text_html}\n</div>\n'
                         )
                 elif text.startswith("If BIOS SEV-SNP is off"):
-                	text_html = parse_inline(text)
-                	html_body.append(
-                		f'<div class="callout warn">\n  <span class="tag">Warning</span>\n  {text_html}\n</div>\n'
-                	)
+                        text_html = parse_inline(text)
+                        html_body.append(
+                                f'<div class="callout warn">\n  <span class="tag">Warning</span>\n  {text_html}\n</div>\n'
+                        )
                 elif text.startswith("⚠️"):
                         text_html = parse_inline(text[1:].strip())
                         html_body.append(
